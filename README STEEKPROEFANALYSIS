@@ -1,0 +1,66 @@
+Webscraper voor Nederlandse burgerinitiatieven
+Crawlt per burgercollectief de hele website en extraheert KvK-nummer, RSIN/BTW,
+jaarverslag, werkgebied, vestigingsplaats, vrijwilligers-indicatie, etc.
+Installatie
+bash# 1. Virtuele omgeving (aanbevolen)
+python -m venv .venv
+source .venv/bin/activate            # macOS / Linux
+# .venv\Scripts\activate             # Windows
+
+# 2. Dependencies
+pip install -r requirements.txt
+
+# 3. Optioneel — alleen nodig voor JS-zware sites:
+playwright install chromium
+Werkt op Python 3.10 of nieuwer.
+Gebruik
+Volledige batch — plaats burgerinitiatieven.xlsx in dezelfde map en run:
+bashpython burgerinitiatieven_scraper.py
+Verwachte input-kolommen: KoepelOrganisatie, steekproef,
+Naam Burgercollectief, Website.
+Output:
+
+burgerinitiatieven_gescraped.xlsx — sheet data (resultaten) + sheet log
+burgerinitiatieven_gescraped.csv — zelfde data als CSV
+scrape.log — debug-log
+./cache/<domein>/ — gecachete HTML/PDF (versnelt herhaalde runs)
+
+Snelle test — als burgerinitiatieven.xlsx ontbreekt, of met --test,
+draait een testset van 6 URL's en schrijft naar test_output.xlsx/.csv:
+bashpython burgerinitiatieven_scraper.py --test
+Notebook-gebruik
+Dit .py-bestand bevat # %%-celmarkers. Open in:
+
+VS Code: open het bestand en gebruik "Run Cell" boven elke # %%-regel.
+Jupyter: installeer jupytext (pip install jupytext) en open de .py
+als notebook — Jupytext converteert de cellen automatisch.
+
+CONFIG aanpassen
+Bovenin burgerinitiatieven_scraper.py staat een CONFIG-blok:
+VariabeleDefaultWatINPUT_PATHburgerinitiatieven.xlsxPad inputOUTPUT_XLSX / OUTPUT_CSVburgerinitiatieven_gescraped.*Pad outputMAX_CRAWL_DEPTH3Hoe diep volgen we interne linksMAX_PAGES_PER_SITE60Harde bovengrens per siteREQUEST_DELAY_SECONDS1.5Pauze tussen requests naar zelfde domeinREQUEST_TIMEOUT10Timeout per request (s)MAX_RETRIES3Aantal retries (exponential backoff)USE_PLAYWRIGHT_FALLBACKTrueJS-fallback aan/uitUSER_AGENT(zie code)Voeg hier je eigen contact-email toe
+Vergeet niet je e-mailadres in de USER_AGENT te zetten — dat is hoort bij
+beleefd scrapen, zodat sites weten wie ze in hun logs zien.
+Wat het script wel/niet doet
+Wel:
+
+Volgt robots.txt, beleefde delays (1.5s/domein), retries met backoff.
+Geeft prioriteit aan ANBI-, over-ons-, jaarverslag-pagina's.
+Parseert PDF-jaarverslagen op het eigen domein.
+Detecteert wanneer een site JS-rendering nodig heeft en schakelt dan
+optioneel Playwright in (alleen als die geïnstalleerd is).
+Cachet alles per domein — herhaalde runs zijn snel en belasten de site niet.
+
+Niet (out-of-scope voor deze versie):
+
+Geen KvK Handelsregister-lookup voor velden die niet op de site staan
+(in de code is een hook waar je dit kunt toevoegen).
+Geen parallellisme over meerdere domeinen — sequentieel om sites niet te
+overbelasten. Bij honderden sites kun je concurrent.futures toevoegen
+met een max-workers gelijk aan het aantal unieke domeinen.
+Geen detectie van Cloudflare/anti-bot-pagina's (status 403 wordt gelogd).
+
+Verwachte trefferpercentage per veld
+Op basis van wat doorgaans op websites van burgerinitiatieven staat:
+VeldKans op vindenToelichtingVestigingsplaatsHoogVrijwel altijd in footer/contactVrijwilligHoog"Vrijwilligers" wordt vaak genoemdWerkgebiedMiddel-hoogSoms impliciet in plaatsnaamWinstoogmerkMiddelStichting/vereniging-vermelding meestal aanwezigExclusief voor ledenMiddelSoms expliciet, vaak implicietKvK-nummerMiddelVaak op ANBI-pagina, niet altijdRSINLaag-middelVooral op ANBI-pagina'sJaarverslagMiddelWisselt sterk per initiatiefSectorcode (SBI)Zeer laagStaat zelden op websites
+Voor de structureel ontbrekende velden (vooral SBI-code, soms KvK/RSIN) is
+een aanvullende KvK-lookup nodig — die zou ik in een vervolgstap toevoegen.

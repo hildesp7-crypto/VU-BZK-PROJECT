@@ -1,0 +1,1292 @@
+# %% [markdown]
+# # Webscraper voor Nederlandse burgerinitiatieven
+#
+# Voor elk burgerinitiatief in `burgerinitiatieven.xlsx` wordt de hele website
+# doorlopen en de gevraagde velden gevuld op basis van de gevonden inhoud:
+# KvK-Nummer, RSIN/BTW, Exclusief voor leden, Winstoogmerk, Jaarverslag,
+# Werkgebied, Sectorcode, Vestigingsplaats, Vrijwillig, KVK/RSIN van website.
+#
+# ## Installatie
+#
+# ```bash
+# pip install -r requirements.txt
+# # Optioneel — alleen nodig als USE_PLAYWRIGHT_FALLBACK = True:
+# playwright install chromium
+# ```
+#
+# ## Uitvoeren
+#
+# - Plaats `burgerinitiatieven.xlsx` in dezelfde map (of pas INPUT_PATH aan).
+# - Run: `python burgerinitiatieven_scraper.py`
+# - Output: `burgerinitiatieven_gescraped.xlsx`, `burgerinitiatieven_gescraped.csv`
+# - Log: `scrape.log`, cache: `./cache/<domein>/`
+#
+# Dit `.py`-bestand werkt ook als notebook: de `# %%`-markers zijn celgrenzen
+# in VS Code (Python Interactive) en Jupyter (via jupytext).
+
+# %%
+"""Scraper voor Nederlandse burgerinitiatieven — modules en imports."""
+from __future__ import annotations
+
+import hashlib
+import logging
+import re
+import sys
+import time
+import urllib.parse as urlparse
+import urllib.robotparser as robotparser
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+import requests
+import tldextract
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from tqdm import tqdm
+from urllib3.util.retry import Retry
+
+# Optionele dependencies — script blijft werkbaar als ze ontbreken.
+try:
+    import pdfplumber
+    HAS_PDFPLUMBER = True
+except ImportError:
+    HAS_PDFPLUMBER = False
+
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+
+
+# %%
+# =============================================================================
+# CONFIG — alle instelbare parameters op één plek
+# =============================================================================
+
+INPUT_PATH: str = "burgerinitiatieven.xlsx"
+OUTPUT_XLSX: str = "burgerinitiatieven_gescraped.xlsx"
+OUTPUT_CSV: str = "burgerinitiatieven_gescraped.csv"
+LOG_FILE: str = "scrape.log"
+CACHE_DIR: Path = Path("./cache")
+
+# Crawling
+MAX_CRAWL_DEPTH: int = 3
+MAX_PAGES_PER_SITE: int = 60          # harde bovengrens om runaway-crawls te voorkomen
+REQUEST_DELAY_SECONDS: float = 1.5    # tussen requests naar hetzelfde domein
+REQUEST_TIMEOUT: int = 10
+MAX_RETRIES: int = 3
+
+# Playwright-fallback wordt alleen ingezet als statische scrape te weinig oplevert.
+USE_PLAYWRIGHT_FALLBACK: bool = True
+PLAYWRIGHT_TRIGGER_BODY_CHARS: int = 400  # < dit aantal text-chars → playwright proberen
+
+# Pagina-prioriteit: relatieve paden die typisch ANBI/KvK/jaarverslag bevatten.
+PRIORITY_PATHS: tuple[str, ...] = (
+    "/anbi", "/over-ons", "/over", "/contact", "/statuten",
+    "/jaarverslag", "/jaarverslagen", "/jaarrekening",
+    "/transparantie", "/financien", "/financieel", "/bestuur",
+    "/organisatie", "/colofon", "/disclaimer",
+)
+
+# Bestandsextensies die we tijdens crawlen overslaan (geen HTML, geen PDF).
+SKIP_EXTENSIONS: tuple[str, ...] = (
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
+    ".css", ".js", ".mp4", ".mp3", ".webm", ".woff", ".woff2",
+    ".ttf", ".eot", ".zip", ".tar", ".gz", ".docx", ".doc",
+    ".xlsx", ".xls", ".pptx", ".ppt",
+)
+
+# Voeg hier je eigen contact-e-mail toe voor beleefd scrapen.
+USER_AGENT: str = (
+    "BurgerinitiatievenResearchBot/1.0 "
+    "(+contact: jouw-email@voorbeeld.nl; doel: academisch onderzoek)"
+)
+
+# Nieuwe kolommen in de exacte gevraagde volgorde.
+NEW_COLUMNS: tuple[str, ...] = (
+    "KvK-Nummer", "RSIN/BTW nummer", "RSIN",
+    "Exclusief voor leden", "Winstoogmerk", "Opmerking",
+    "Jaarverslag", "Werkgebied", "Sectorcode",
+    "Vestigingsplaats", "Vrijwillig",
+    "KVK van website", "RSIN van website",
+)
+
+
+# %%
+# =============================================================================
+# Logging — INFO naar stdout, DEBUG naar bestand
+# =============================================================================
+
+def setup_logging(log_file: str = LOG_FILE) -> logging.Logger:
+    """Configureer logging: INFO naar console, DEBUG naar `scrape.log`."""
+    logger = logging.getLogger("scraper")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setLevel(logging.INFO)
+    stream.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s",
+                                           datefmt="%H:%M:%S"))
+    logger.addHandler(stream)
+
+    fh = logging.FileHandler(log_file, mode="w", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s [%(funcName)s] %(message)s"))
+    logger.addHandler(fh)
+
+    return logger
+
+
+log = setup_logging()
+if not HAS_PDFPLUMBER:
+    log.warning("pdfplumber ontbreekt — PDF-jaarverslagen worden niet geparsed. "
+                "Installeer met: pip install pdfplumber")
+if not HAS_PLAYWRIGHT and USE_PLAYWRIGHT_FALLBACK:
+    log.warning("playwright ontbreekt — fallback voor JS-zware sites is uitgeschakeld. "
+                "Installeer met: pip install playwright && playwright install chromium")
+
+
+# %%
+# =============================================================================
+# Nederlandse gemeenten + provincies + regio's (voor Werkgebied/Vestigingsplaats)
+# =============================================================================
+# Lijst van huidige Nederlandse gemeenten (2024). Niet 100% volledig maar dekt
+# de overgrote meerderheid. Aanvullen kan vrij.
+
+NL_PROVINCIES: frozenset[str] = frozenset({
+    "Drenthe", "Flevoland", "Friesland", "Fryslân", "Gelderland",
+    "Groningen", "Limburg", "Noord-Brabant", "Noord-Holland",
+    "Overijssel", "Utrecht", "Zeeland", "Zuid-Holland",
+})
+
+NL_REGIOS: frozenset[str] = frozenset({
+    "Randstad", "Veluwe", "Achterhoek", "Twente", "Drechtsteden",
+    "Kop van Noord-Holland", "Westland", "Gooi en Vechtstreek",
+    "Rivierengebied", "Krimpenerwaard", "Alblasserwaard",
+    "Liemers", "Kempen", "Peel", "Salland", "Zaanstreek",
+    "Waterland", "Bollenstreek", "Hoeksche Waard", "Goeree-Overflakkee",
+    "Walcheren", "Zeeuws-Vlaanderen", "Tholen", "Schouwen-Duiveland",
+    "Texel", "Vlieland", "Terschelling", "Ameland", "Schiermonnikoog",
+    "Nederland",  # landelijk
+})
+
+NL_GEMEENTEN: frozenset[str] = frozenset({
+    # Noord-Holland
+    "Aalsmeer", "Alkmaar", "Amstelveen", "Amsterdam", "Beemster", "Bergen",
+    "Beverwijk", "Blaricum", "Bloemendaal", "Castricum", "Diemen", "Drechterland",
+    "Edam-Volendam", "Enkhuizen", "Gooise Meren", "Haarlem", "Haarlemmermeer",
+    "Heemskerk", "Heemstede", "Heerhugowaard", "Heiloo", "Den Helder",
+    "Hilversum", "Hollands Kroon", "Hoorn", "Huizen", "Koggenland", "Landsmeer",
+    "Langedijk", "Laren", "Medemblik", "Oostzaan", "Opmeer", "Ouder-Amstel",
+    "Purmerend", "Schagen", "Stede Broec", "Texel", "Uitgeest", "Uithoorn",
+    "Velsen", "Waterland", "Weesp", "Wijdemeren", "Wormerland", "Zaanstad",
+    "Zandvoort",
+    # Zuid-Holland
+    "Alblasserdam", "Albrandswaard", "Alphen aan den Rijn", "Barendrecht",
+    "Bodegraven-Reeuwijk", "Brielle", "Capelle aan den IJssel", "Delft",
+    "Dordrecht", "Goeree-Overflakkee", "Gorinchem", "Gouda", "'s-Gravenhage",
+    "Den Haag", "Hardinxveld-Giessendam", "Hellevoetsluis", "Hendrik-Ido-Ambacht",
+    "Hillegom", "Hoeksche Waard", "Kaag en Braassem", "Katwijk", "Krimpen aan den IJssel",
+    "Krimpenerwaard", "Lansingerland", "Leiden", "Leiderdorp", "Leidschendam-Voorburg",
+    "Lisse", "Maassluis", "Midden-Delfland", "Molenlanden", "Nieuwkoop",
+    "Nissewaard", "Noordwijk", "Oegstgeest", "Papendrecht", "Pijnacker-Nootdorp",
+    "Ridderkerk", "Rijswijk", "Rotterdam", "Schiedam", "Sliedrecht", "Teylingen",
+    "Vlaardingen", "Voorschoten", "Waddinxveen", "Wassenaar", "Westland", "Westvoorne",
+    "Zoetermeer", "Zoeterwoude", "Zuidplas", "Zwijndrecht", "Voorne aan Zee",
+    # Utrecht
+    "Amersfoort", "Baarn", "De Bilt", "Bunnik", "Bunschoten", "Eemnes",
+    "Houten", "IJsselstein", "Leusden", "Lopik", "Montfoort", "Nieuwegein",
+    "Oudewater", "Renswoude", "Rhenen", "De Ronde Venen", "Soest", "Stichtse Vecht",
+    "Utrecht", "Utrechtse Heuvelrug", "Veenendaal", "Vijfheerenlanden",
+    "Wijk bij Duurstede", "Woerden", "Woudenberg", "Zeist",
+    # Gelderland
+    "Aalten", "Apeldoorn", "Arnhem", "Barneveld", "Berg en Dal", "Berkelland",
+    "Beuningen", "Bronckhorst", "Brummen", "Buren", "Culemborg", "Doesburg",
+    "Doetinchem", "Druten", "Duiven", "Ede", "Elburg", "Epe", "Ermelo",
+    "Harderwijk", "Hattem", "Heerde", "Heumen", "Lingewaard", "Lochem",
+    "Maasdriel", "Montferland", "Neder-Betuwe", "Nijkerk", "Nijmegen",
+    "Nunspeet", "Oldebroek", "Oost Gelre", "Oude IJsselstreek", "Overbetuwe",
+    "Putten", "Renkum", "Rheden", "Rozendaal", "Scherpenzeel", "Tiel",
+    "Voorst", "Wageningen", "West Betuwe", "West Maas en Waal", "Westervoort",
+    "Wijchen", "Winterswijk", "Zaltbommel", "Zevenaar", "Zutphen",
+    # Overijssel
+    "Almelo", "Borne", "Dalfsen", "Deventer", "Dinkelland", "Enschede",
+    "Hardenberg", "Hellendoorn", "Hengelo", "Hof van Twente", "Kampen",
+    "Losser", "Oldenzaal", "Olst-Wijhe", "Ommen", "Raalte", "Rijssen-Holten",
+    "Staphorst", "Steenwijkerland", "Tubbergen", "Twenterand", "Wierden",
+    "Zwartewaterland", "Zwolle",
+    # Flevoland
+    "Almere", "Dronten", "Lelystad", "Noordoostpolder", "Urk", "Zeewolde",
+    # Drenthe
+    "Aa en Hunze", "Assen", "Borger-Odoorn", "Coevorden", "Emmen",
+    "Hoogeveen", "Meppel", "Midden-Drenthe", "Noordenveld", "Tynaarlo",
+    "Westerveld", "De Wolden",
+    # Groningen
+    "Eemsdelta", "Groningen", "Het Hogeland", "Midden-Groningen",
+    "Oldambt", "Pekela", "Stadskanaal", "Veendam", "Westerkwartier", "Westerwolde",
+    # Friesland / Fryslân
+    "Achtkarspelen", "Ameland", "Dantumadiel", "De Fryske Marren", "Harlingen",
+    "Heerenveen", "Leeuwarden", "Noardeast-Fryslân", "Ooststellingwerf",
+    "Opsterland", "Schiermonnikoog", "Smallingerland", "Súdwest-Fryslân",
+    "Terschelling", "Tytsjerksteradiel", "Vlieland", "Waadhoeke", "Weststellingwerf",
+    # Zeeland
+    "Borsele", "Goes", "Hulst", "Kapelle", "Middelburg", "Noord-Beveland",
+    "Reimerswaal", "Schouwen-Duiveland", "Sluis", "Terneuzen", "Tholen",
+    "Veere", "Vlissingen",
+    # Noord-Brabant
+    "Alphen-Chaam", "Altena", "Asten", "Baarle-Nassau", "Bergeijk",
+    "Bergen op Zoom", "Bernheze", "Best", "Bladel", "Boekel", "Boxtel",
+    "Breda", "Cranendonck", "Deurne", "Dongen", "Drimmelen", "Eersel",
+    "Eindhoven", "Etten-Leur", "Geertruidenberg", "Geldrop-Mierlo", "Gemert-Bakel",
+    "Gilze en Rijen", "Goirle", "Halderberge", "Heeze-Leende", "Helmond",
+    "'s-Hertogenbosch", "Den Bosch", "Heusden", "Hilvarenbeek", "Land van Cuijk",
+    "Laarbeek", "Loon op Zand", "Maashorst", "Meierijstad", "Moerdijk",
+    "Nuenen", "Oirschot", "Oisterwijk", "Oosterhout", "Oss", "Reusel-De Mierden",
+    "Roosendaal", "Rucphen", "Sint-Michielsgestel", "Someren", "Son en Breugel",
+    "Steenbergen", "Tilburg", "Valkenswaard", "Veldhoven", "Vught", "Waalre",
+    "Waalwijk", "Woensdrecht", "Zundert",
+    # Limburg
+    "Beek", "Beekdaelen", "Beesel", "Bergen", "Brunssum", "Echt-Susteren",
+    "Eijsden-Margraten", "Gennep", "Gulpen-Wittem", "Heerlen", "Horst aan de Maas",
+    "Kerkrade", "Landgraaf", "Leudal", "Maasgouw", "Maastricht", "Meerssen",
+    "Mook en Middelaar", "Nederweert", "Peel en Maas", "Roerdalen", "Roermond",
+    "Simpelveld", "Sittard-Geleen", "Stein", "Vaals", "Valkenburg aan de Geul",
+    "Venlo", "Venray", "Voerendaal", "Weert",
+})
+
+# Lower-case lookup voor matching
+_GEMEENTEN_LOOKUP: dict[str, str] = {g.lower(): g for g in NL_GEMEENTEN}
+_PROVINCIES_LOOKUP: dict[str, str] = {p.lower(): p for p in NL_PROVINCIES}
+_REGIOS_LOOKUP: dict[str, str] = {r.lower(): r for r in NL_REGIOS}
+
+
+# %%
+# =============================================================================
+# URL-utilities
+# =============================================================================
+
+def clean_url(raw: str) -> str:
+    """Strip Markdown-link-syntax en voeg schema toe als dat ontbreekt.
+
+    Voorbeelden:
+      "[www.voorbeeld.nl](https://www.voorbeeld.nl)" -> "https://www.voorbeeld.nl"
+      "www.voorbeeld.nl" -> "https://www.voorbeeld.nl"
+    """
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return ""
+    url = str(raw).strip()
+    md = re.match(r"\[.*?\]\((.+?)\)", url)
+    if md:
+        url = md.group(1).strip()
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
+
+def get_registered_domain(url: str) -> str:
+    """Geef het 'eTLD+1'-domein terug (bv. 'boschgaard.nl')."""
+    ext = tldextract.extract(url)
+    if not ext.suffix:
+        return ext.domain
+    return f"{ext.domain}.{ext.suffix}"
+
+
+def is_same_registered_domain(url1: str, url2: str) -> bool:
+    """True als beide URL's hetzelfde geregistreerde domein delen."""
+    return get_registered_domain(url1) == get_registered_domain(url2) and bool(
+        get_registered_domain(url1))
+
+
+def url_path_lower(url: str) -> str:
+    """Geef het pad-deel van een URL in lowercase, zonder query/fragment."""
+    return urlparse.urlsplit(url).path.lower()
+
+
+def hash_url(url: str) -> str:
+    """Korte SHA1-hash van een URL, bruikbaar als bestandsnaam."""
+    return hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+
+
+# %%
+# =============================================================================
+# Cache — bestand-gebaseerd, per domein
+# =============================================================================
+
+def cache_paths(url: str) -> tuple[Path, Path]:
+    """Geef (content_path, meta_path) terug voor een gegeven URL."""
+    domain = get_registered_domain(url) or "_unknown_"
+    folder = CACHE_DIR / domain
+    folder.mkdir(parents=True, exist_ok=True)
+    base = folder / hash_url(url)
+    # Extensie bepalen op basis van URL
+    ext = ".pdf" if url.lower().endswith(".pdf") else ".html"
+    return base.with_suffix(ext), base.with_suffix(".meta")
+
+
+def cache_get(url: str) -> Optional[bytes]:
+    """Lees gecachete content voor `url` of None als die niet bestaat."""
+    content_path, _ = cache_paths(url)
+    if content_path.exists():
+        try:
+            return content_path.read_bytes()
+        except OSError as e:
+            log.debug("Cache-leesfout %s: %s", content_path, e)
+    return None
+
+
+def cache_put(url: str, content: bytes) -> None:
+    """Sla `content` op in de cache onder de bijbehorende URL-locatie."""
+    content_path, meta_path = cache_paths(url)
+    try:
+        content_path.write_bytes(content)
+        meta_path.write_text(f"{url}\n{time.time()}\n", encoding="utf-8")
+    except OSError as e:
+        log.debug("Cache-schrijffout %s: %s", content_path, e)
+
+
+# %%
+# =============================================================================
+# HTTP-sessie met retries + robots.txt
+# =============================================================================
+
+_robots_cache: dict[str, Optional[robotparser.RobotFileParser]] = {}
+_last_fetch_per_domain: dict[str, float] = {}
+
+
+def make_session() -> requests.Session:
+    """Maak één requests.Session met sane defaults en automatische retries."""
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "nl,en;q=0.8",
+    })
+    retry = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=1.5,                    # 1.5s, 3s, 6s
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "HEAD"),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    return sess
+
+
+SESSION = make_session()
+
+
+def robots_allows(url: str) -> bool:
+    """Controleer robots.txt voor `url`. Faalt veilig (True) bij fouten."""
+    domain_key = urlparse.urlsplit(url).netloc
+    if not domain_key:
+        return True
+    if domain_key not in _robots_cache:
+        rp = robotparser.RobotFileParser()
+        robots_url = urlparse.urlunsplit(
+            (urlparse.urlsplit(url).scheme or "https", domain_key, "/robots.txt", "", ""))
+        try:
+            resp = SESSION.get(robots_url, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 200:
+                rp.parse(resp.text.splitlines())
+                _robots_cache[domain_key] = rp
+            else:
+                _robots_cache[domain_key] = None
+        except requests.RequestException as e:
+            log.debug("robots.txt niet ophaalbaar voor %s: %s", domain_key, e)
+            _robots_cache[domain_key] = None
+    rp = _robots_cache[domain_key]
+    if rp is None:
+        return True
+    return rp.can_fetch(USER_AGENT, url)
+
+
+def polite_wait(url: str) -> None:
+    """Wacht zodat we per domein hooguit één request per REQUEST_DELAY_SECONDS doen."""
+    domain = get_registered_domain(url)
+    last = _last_fetch_per_domain.get(domain, 0.0)
+    elapsed = time.time() - last
+    if elapsed < REQUEST_DELAY_SECONDS:
+        time.sleep(REQUEST_DELAY_SECONDS - elapsed)
+    _last_fetch_per_domain[domain] = time.time()
+
+
+# %%
+# =============================================================================
+# Fetch — met cache, robots.txt, delay, retries
+# =============================================================================
+
+@dataclass
+class FetchResult:
+    """Resultaat van één fetch."""
+    url: str
+    status: int
+    content: bytes
+    content_type: str
+    from_cache: bool
+    error: Optional[str] = None
+
+    @property
+    def text(self) -> str:
+        """Decodeer content als tekst (best effort)."""
+        try:
+            # Detecteer encoding via meta tags / HTTP header indien mogelijk
+            return self.content.decode("utf-8", errors="replace")
+        except UnicodeDecodeError:
+            return self.content.decode("latin-1", errors="replace")
+
+    @property
+    def is_html(self) -> bool:
+        return "html" in (self.content_type or "").lower()
+
+    @property
+    def is_pdf(self) -> bool:
+        return "pdf" in (self.content_type or "").lower() or self.url.lower().endswith(".pdf")
+
+
+def fetch(url: str, use_cache: bool = True) -> FetchResult:
+    """Haal `url` op, met cache-ondersteuning. Gooit nooit, geeft FetchResult."""
+    # Cache check
+    if use_cache:
+        cached = cache_get(url)
+        if cached is not None:
+            ct = "application/pdf" if url.lower().endswith(".pdf") else "text/html"
+            log.debug("Cache-hit: %s", url)
+            return FetchResult(url=url, status=200, content=cached,
+                               content_type=ct, from_cache=True)
+
+    # robots.txt
+    if not robots_allows(url):
+        log.info("robots.txt verbiedt %s — overgeslagen", url)
+        return FetchResult(url=url, status=0, content=b"", content_type="",
+                           from_cache=False, error="robots.txt disallow")
+
+    polite_wait(url)
+
+    try:
+        resp = SESSION.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+    except requests.RequestException as e:
+        log.warning("Fetch-fout %s: %s", url, e)
+        return FetchResult(url=url, status=0, content=b"", content_type="",
+                           from_cache=False, error=str(e))
+
+    ct = resp.headers.get("Content-Type", "").lower()
+    if resp.status_code == 200 and resp.content:
+        cache_put(url, resp.content)
+    return FetchResult(url=resp.url, status=resp.status_code,
+                       content=resp.content, content_type=ct,
+                       from_cache=False,
+                       error=None if resp.status_code == 200 else f"HTTP {resp.status_code}")
+
+
+# %%
+# =============================================================================
+# Playwright-fallback voor JS-zware sites
+# =============================================================================
+
+class PlaywrightFetcher:
+    """Lazy-initialised playwright browser; één instantie hergebruiken."""
+
+    def __init__(self) -> None:
+        self._pw = None
+        self._browser = None
+        self._enabled = HAS_PLAYWRIGHT and USE_PLAYWRIGHT_FALLBACK
+
+    def fetch(self, url: str) -> Optional[FetchResult]:
+        """Haal `url` op met een echte browser. Return None bij fout/uitgeschakeld."""
+        if not self._enabled:
+            return None
+        try:
+            if self._pw is None:
+                self._pw = sync_playwright().start()
+                self._browser = self._pw.chromium.launch(headless=True)
+                log.info("Playwright-browser gestart (eenmalig)")
+            ctx = self._browser.new_context(user_agent=USER_AGENT, locale="nl-NL")
+            page = ctx.new_page()
+            page.set_default_timeout(REQUEST_TIMEOUT * 1000)
+            page.goto(url, wait_until="networkidle", timeout=REQUEST_TIMEOUT * 2000)
+            html = page.content()
+            ctx.close()
+            content = html.encode("utf-8")
+            cache_put(url, content)
+            return FetchResult(url=url, status=200, content=content,
+                               content_type="text/html", from_cache=False)
+        except PWTimeoutError as e:
+            log.warning("Playwright timeout op %s: %s", url, e)
+            return None
+        except Exception as e:                      # noqa: BLE001 — fallback nooit fataal
+            log.warning("Playwright-fout op %s: %s", url, e)
+            return None
+
+    def close(self) -> None:
+        """Sluit de browser netjes af."""
+        try:
+            if self._browser:
+                self._browser.close()
+            if self._pw:
+                self._pw.stop()
+        except Exception:                            # noqa: BLE001
+            pass
+
+
+PW_FETCHER = PlaywrightFetcher()
+
+
+def needs_playwright(result: FetchResult) -> bool:
+    """Heuristiek: heeft deze pagina JS-rendering nodig?"""
+    if not result.is_html or result.status != 200:
+        return False
+    try:
+        soup = BeautifulSoup(result.content, "lxml")
+    except Exception:                                # noqa: BLE001
+        return False
+    text = soup.get_text(" ", strip=True)
+    if len(text) < PLAYWRIGHT_TRIGGER_BODY_CHARS:
+        # SPA-markers in lege body
+        spa_markers = ('id="root"', 'id="app"', 'ng-app', 'data-reactroot',
+                       'window.__NUXT__', 'window.__INITIAL_STATE__')
+        html_str = result.content.decode("utf-8", errors="ignore").lower()
+        return any(m.lower() in html_str for m in spa_markers) or len(text) < 100
+    return False
+
+
+def fetch_smart(url: str) -> FetchResult:
+    """Fetch met automatische playwright-fallback bij dunne HTML."""
+    result = fetch(url)
+    if result.status == 200 and result.is_html and needs_playwright(result):
+        log.info("Statische scrape leverde te weinig content voor %s — playwright proberen",
+                 url)
+        pw_result = PW_FETCHER.fetch(url)
+        if pw_result is not None and len(pw_result.text) > len(result.text):
+            return pw_result
+    return result
+
+
+# %%
+# =============================================================================
+# Crawler — BFS tot max diepte, prioriteit voor relevante paden
+# =============================================================================
+
+@dataclass
+class CrawlResult:
+    """Verzamelde data voor één gecrawlde site."""
+    start_url: str
+    pages: dict[str, str] = field(default_factory=dict)    # url -> text content
+    soups: dict[str, BeautifulSoup] = field(default_factory=dict)
+    pdfs: dict[str, str] = field(default_factory=dict)      # pdf url -> extracted text
+    errors: list[str] = field(default_factory=list)
+    visited_count: int = 0
+
+
+def normalize_url(url: str) -> str:
+    """Normaliseer: verwijder fragment, sorteer query niet (kan semantisch zijn)."""
+    parts = urlparse.urlsplit(url)
+    return urlparse.urlunsplit((parts.scheme, parts.netloc, parts.path or "/",
+                                parts.query, ""))
+
+
+def collect_internal_links(soup: BeautifulSoup, base_url: str) -> list[str]:
+    """Verzamel interne links (zelfde geregistreerde domein) uit een soup."""
+    links: list[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith(("mailto:", "tel:", "javascript:", "#")):
+            continue
+        absolute = urlparse.urljoin(base_url, href)
+        if not absolute.startswith(("http://", "https://")):
+            continue
+        if not is_same_registered_domain(absolute, base_url):
+            continue
+        path = urlparse.urlsplit(absolute).path.lower()
+        # Sla niet-relevante extensies over (behalve PDF)
+        if any(path.endswith(ext) for ext in SKIP_EXTENSIONS):
+            continue
+        links.append(normalize_url(absolute))
+    return links
+
+
+def is_priority_url(url: str) -> bool:
+    """True als de URL een van de prioritaire paden bevat."""
+    path = url_path_lower(url)
+    return any(p in path for p in PRIORITY_PATHS)
+
+
+def crawl_site(start_url: str,
+               max_depth: int = MAX_CRAWL_DEPTH,
+               max_pages: int = MAX_PAGES_PER_SITE) -> CrawlResult:
+    """Crawl een website breedte-eerst tot `max_depth` en `max_pages`.
+
+    Pagina's met prioritaire paden (ANBI, over-ons, jaarverslag, etc.) worden
+    als eerste bezocht binnen elke diepte-laag.
+    """
+    result = CrawlResult(start_url=start_url)
+    visited: set[str] = set()
+    queue: deque[tuple[str, int]] = deque([(normalize_url(start_url), 0)])
+
+    while queue and result.visited_count < max_pages:
+        # Sorteer huidige queue zodat prioritaire URL's vooraan staan.
+        priority = sorted(queue, key=lambda x: (not is_priority_url(x[0]), x[1]))
+        queue = deque(priority)
+        url, depth = queue.popleft()
+
+        if url in visited:
+            continue
+        visited.add(url)
+        result.visited_count += 1
+
+        log.debug("Crawl [%d/%d, depth=%d] %s",
+                  result.visited_count, max_pages, depth, url)
+        try:
+            res = fetch_smart(url)
+        except Exception as e:                       # noqa: BLE001
+            log.warning("Onverwachte fout bij %s: %s", url, e)
+            result.errors.append(f"{url}: {e}")
+            continue
+
+        if res.error:
+            result.errors.append(f"{url}: {res.error}")
+            continue
+
+        if res.is_pdf:
+            pdf_text = extract_text_from_pdf(res)
+            if pdf_text:
+                result.pdfs[url] = pdf_text
+                log.debug("PDF geparsed (%d chars): %s", len(pdf_text), url)
+            continue
+
+        if not res.is_html:
+            continue
+
+        try:
+            soup = BeautifulSoup(res.content, "lxml")
+        except Exception as e:                       # noqa: BLE001
+            log.debug("Parse-fout %s: %s", url, e)
+            continue
+
+        # Verwijder script/style voor schonere tekst
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+
+        page_text = soup.get_text(" ", strip=True)
+        result.pages[url] = page_text
+        result.soups[url] = soup
+
+        if depth >= max_depth:
+            continue
+
+        for link in collect_internal_links(soup, url):
+            if link not in visited:
+                queue.append((link, depth + 1))
+
+    # Voeg expliciet bekende prioriteits-paden toe als ze nog niet bezocht zijn.
+    for p in PRIORITY_PATHS:
+        candidate = normalize_url(urlparse.urljoin(start_url, p))
+        if candidate not in visited and result.visited_count < max_pages:
+            try:
+                res = fetch_smart(candidate)
+                if res.status == 200 and res.is_html:
+                    soup = BeautifulSoup(res.content, "lxml")
+                    for tag in soup(["script", "style", "noscript"]):
+                        tag.decompose()
+                    result.pages[candidate] = soup.get_text(" ", strip=True)
+                    result.soups[candidate] = soup
+                    result.visited_count += 1
+                    log.debug("Prioriteits-pad gevonden: %s", candidate)
+            except Exception:                        # noqa: BLE001
+                pass
+
+    return result
+
+
+# %%
+# =============================================================================
+# PDF-extractie
+# =============================================================================
+
+def extract_text_from_pdf(result: FetchResult) -> str:
+    """Extraheer tekst uit een PDF-FetchResult met pdfplumber."""
+    if not HAS_PDFPLUMBER:
+        return ""
+    try:
+        import io as _io
+        with pdfplumber.open(_io.BytesIO(result.content)) as pdf:
+            parts: list[str] = []
+            for page in pdf.pages[:30]:                # max 30 pagina's per PDF
+                txt = page.extract_text() or ""
+                parts.append(txt)
+            return "\n".join(parts)
+    except Exception as e:                            # noqa: BLE001
+        log.debug("PDF-parse-fout %s: %s", result.url, e)
+        return ""
+
+
+# %%
+# =============================================================================
+# Field-extractors — één functie per gevraagd veld
+# =============================================================================
+
+def _context_window(text: str, match: re.Match, before: int = 80,
+                    after: int = 80) -> str:
+    """Geef de tekst-context rond een regex-match in lowercase."""
+    s = max(0, match.start() - before)
+    e = min(len(text), match.end() + after)
+    return text[s:e].lower()
+
+
+def extract_kvk(text: str) -> Optional[str]:
+    """Vind KvK-nummer (exact 8 cijfers) met context-validatie.
+
+    Vereist dat 'kvk', 'kamer van koophandel' of 'handelsregister' binnen
+    ±80 tekens van het nummer staat — voorkomt valse positieven op
+    telefoonnummers of postcodes.
+    """
+    # 1. Directe match met label vóór het nummer
+    pat = re.compile(
+        r"(?:kvk[\s\-:.]*(?:nummer|nr|num)?|kamer\s+van\s+koophandel|"
+        r"handelsregister)[\s\-:.,]*?(\d{8})\b",
+        re.IGNORECASE,
+    )
+    m = pat.search(text)
+    if m:
+        return m.group(1)
+
+    # 2. Fallback: elk 8-cijferig getal met kvk-keyword in venster
+    keywords = ("kvk", "kamer van koophandel", "handelsregister")
+    for m in re.finditer(r"(?<!\d)(\d{8})(?!\d)", text):
+        ctx = _context_window(text, m)
+        if any(k in ctx for k in keywords):
+            return m.group(1)
+    return None
+
+
+def extract_rsin(text: str) -> Optional[str]:
+    """Vind RSIN (exact 9 cijfers) met context-validatie."""
+    pat = re.compile(
+        r"(?:rsin|fiscaal\s*nummer|fiscaalnummer|"
+        r"fiscaal\s*identificatienummer)[\s\-:.,]*?(\d{9})\b",
+        re.IGNORECASE,
+    )
+    m = pat.search(text)
+    if m:
+        return m.group(1)
+
+    keywords = ("rsin", "fiscaal nummer", "fiscaalnummer", "fiscaal-nummer",
+                "fiscaal identificatienummer")
+    for m in re.finditer(r"(?<!\d)(\d{9})(?!\d)", text):
+        ctx = _context_window(text, m)
+        if any(k in ctx for k in keywords):
+            return m.group(1)
+    return None
+
+
+def extract_btw(text: str) -> Optional[str]:
+    """Vind BTW-nummer (formaat: NL + 9 cijfers + B + 2 cijfers)."""
+    m = re.search(r"\b(NL\s?\d{9}\s?B\s?\d{2})\b", text, re.IGNORECASE)
+    if m:
+        return re.sub(r"\s+", "", m.group(1)).upper()
+    # Met context
+    m = re.search(r"btw[\s\-:.\w]{0,30}?(NL\s?\d{9}\s?B\s?\d{2})",
+                  text, re.IGNORECASE)
+    if m:
+        return re.sub(r"\s+", "", m.group(1)).upper()
+    return None
+
+
+def extract_members_only(text: str) -> str:
+    """Bepaal of het collectief exclusief voor leden is."""
+    t = text.lower()
+    yes_kw = (
+        "alleen voor leden", "uitsluitend voor leden", "uitsluitend leden",
+        "alleen leden", "besloten gemeenschap", "besloten cooperatie",
+        "besloten coöperatie", "ledenwebsite", "ledenportaal",
+        "inloggen voor leden", "alleen toegankelijk voor leden",
+        "alleen leden hebben toegang",
+    )
+    no_kw = (
+        "iedereen welkom", "open voor iedereen", "voor iedereen toegankelijk",
+        "open gemeenschap", "openbaar toegankelijk",
+    )
+    if any(k in t for k in yes_kw):
+        return "Ja"
+    if any(k in t for k in no_kw):
+        return "Nee"
+    return "Onbekend"
+
+
+def extract_winstoogmerk(text: str) -> str:
+    """Bepaal of de organisatie winstoogmerk heeft.
+
+    Sterke signalen voor 'Nee': expliciete vermelding 'zonder winstoogmerk',
+    'non-profit', ANBI-status. Zwakke signalen: stichting / vereniging /
+    coöperatie. Sterke 'Ja': 'met winstoogmerk', BV / NV-vermelding.
+    """
+    t = text.lower()
+    strong_no = (
+        "zonder winstoogmerk", "geen winstoogmerk", "non-profit", "non profit",
+        "nonprofit", "algemeen nut beogende instelling", "anbi-status",
+        "anbi status", "anbi-instelling",
+    )
+    weak_no = (
+        "stichting", "vereniging", "coöperatie", "cooperatie",
+    )
+    strong_yes = (
+        "met winstoogmerk", "commerciële onderneming", "winstgevend bedrijf",
+    )
+    # \b werkt niet correct na een '.' (zoals in 'b.v.'); expliciete boundaries:
+    legal_yes = re.search(
+        r"(?:^|[\s\(])(b\.?v\.?|n\.?v\.?)(?:[\s,;.\)!?]|$)", t)
+
+    if any(k in t for k in strong_yes):
+        return "Ja"
+    if any(k in t for k in strong_no):
+        return "Nee"
+    if any(k in t for k in weak_no):
+        return "Nee"
+    if legal_yes:
+        return "Ja"
+    return "Onbekend"
+
+
+def extract_volunteers(text: str) -> str:
+    """Bepaal of het collectief (deels) met vrijwilligers werkt."""
+    t = text.lower()
+    yes_kw = (
+        "vrijwilliger", "vrijwilligerswerk", "onbezoldigd",
+        "vrijwillige inzet", "door vrijwilligers", "met vrijwilligers",
+        "onze vrijwilligers", "vrijwilligers-",
+    )
+    if any(k in t for k in yes_kw):
+        return "Ja"
+    return "Onbekend"
+
+
+def extract_jaarverslag(crawl: CrawlResult) -> Optional[str]:
+    """Zoek URL naar het meest recente jaarverslag.
+
+    Doorzoekt alle `<a>`-tags op alle pagina's; scoort kandidaten op
+    bestandstype (PDF > HTML), jaartal en context (ANBI/transparantie).
+    """
+    year_pat = re.compile(r"20(2[0-6]|1[5-9])")
+    candidates: list[tuple[float, str]] = []
+    keywords_link = ("jaarverslag", "jaarrekening", "annual report",
+                     "annual-report", "year report")
+
+    for page_url, soup in crawl.soups.items():
+        page_is_anbi = ("anbi" in page_url.lower()
+                        or "transparantie" in page_url.lower())
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            link_text = a.get_text(" ", strip=True).lower()
+            combined = f"{href.lower()} {link_text}"
+            if not any(k in combined for k in keywords_link):
+                continue
+            abs_url = urlparse.urljoin(page_url, href)
+            if not abs_url.startswith(("http://", "https://")):
+                continue
+            # PDF of HTML, beide acceptabel; voorkeur PDF.
+            is_pdf = abs_url.lower().endswith(".pdf")
+            year_match = year_pat.search(combined)
+            year = int(f"20{year_match.group(1)}") if year_match else 0
+            same_domain = is_same_registered_domain(abs_url, page_url)
+            score = (year * 10
+                     + (5 if is_pdf else 0)
+                     + (3 if page_is_anbi else 0)
+                     + (2 if same_domain else -10))
+            candidates.append((score, abs_url))
+
+    # Ook gevonden PDF's in de crawl-output die niet via een link zijn benoemd
+    for pdf_url in crawl.pdfs:
+        if any(k in pdf_url.lower() for k in keywords_link):
+            year_match = year_pat.search(pdf_url)
+            year = int(f"20{year_match.group(1)}") if year_match else 0
+            candidates.append((year * 10 + 5, pdf_url))
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def _find_place_match(text: str, lookup: dict[str, str]) -> Optional[str]:
+    """Zoek de eerste plaats uit `lookup` (case-insensitive) in `text`.
+
+    Geeft de canonieke (originele) schrijfwijze terug.
+    """
+    t = text.lower()
+    # Sorteren op lengte zodat we eerst meer-woord-namen matchen.
+    for key in sorted(lookup.keys(), key=len, reverse=True):
+        # Word-boundary match
+        if re.search(rf"\b{re.escape(key)}\b", t):
+            return lookup[key]
+    return None
+
+
+def extract_vestigingsplaats(text: str) -> Optional[str]:
+    """Vind vestigingsplaats: Nederlandse gemeente in adres-/contactcontext."""
+    # 1. Probeer expliciete context: 'gevestigd te', 'vestigingsplaats:'
+    for ctx_pat in (
+        r"(?:gevestigd\s+(?:te|in)|vestigingsplaats|statutair\s+gevestigd"
+        r"\s+(?:te|in)|gevestigd:?)[\s:.,]+([A-ZÀ-Ÿ][\w\-\' ]{2,40})",
+    ):
+        m = re.search(ctx_pat, text, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip().rstrip(".,;:")
+            # Verifieer tegen gemeentelijst
+            for word in (candidate, candidate.split()[0]):
+                hit = _find_place_match(word, _GEMEENTEN_LOOKUP)
+                if hit:
+                    return hit
+    # 2. Postcode-pattern (\d{4} ?[A-Z]{2}) gevolgd door plaats
+    pc_pat = re.compile(r"\b\d{4}\s?[A-Z]{2}\s+([A-ZÀ-Ÿ][\w\-\' ]{2,40})",
+                        re.IGNORECASE)
+    m = pc_pat.search(text)
+    if m:
+        candidate = m.group(1).strip().rstrip(".,;:")
+        hit = _find_place_match(candidate, _GEMEENTEN_LOOKUP)
+        if hit:
+            return hit
+    # 3. Fallback: eerste gemeente die überhaupt voorkomt
+    return _find_place_match(text, _GEMEENTEN_LOOKUP)
+
+
+def extract_werkgebied(text: str) -> Optional[str]:
+    """Bepaal het geografische werkgebied: gemeente, regio, provincie of landelijk."""
+    t = text.lower()
+    # 1. Landelijk
+    if re.search(r"\blandelijk(?:\s+(?:actief|werkzaam))?\b", t) \
+            or "heel nederland" in t or "in heel nederland" in t:
+        return "Landelijk (Nederland)"
+    # 2. Werkgebied met expliciete context
+    m = re.search(
+        r"(?:werkgebied|actief\s+in|werkzaam\s+in|werken\s+in)[\s:.,]+"
+        r"([A-ZÀ-Ÿ][\w\-\' ,]{2,80})",
+        text, re.IGNORECASE)
+    if m:
+        candidate = m.group(1).strip()
+        for lookup in (_GEMEENTEN_LOOKUP, _REGIOS_LOOKUP, _PROVINCIES_LOOKUP):
+            hit = _find_place_match(candidate, lookup)
+            if hit:
+                return hit
+        # Anders eerste 60 chars van de context
+        return candidate[:60].rstrip(".,;:")
+    # 3. Match tegen provincie/regio elders in de tekst
+    for lookup in (_PROVINCIES_LOOKUP, _REGIOS_LOOKUP):
+        hit = _find_place_match(text, lookup)
+        if hit:
+            return hit
+    return None
+
+
+def extract_sectorcode(text: str) -> Optional[str]:
+    """Vind SBI-code (4 of 5 cijfers met context)."""
+    pat = re.compile(r"sbi[\s\-:.]*(?:code)?[\s\-:.]*(\d{4,5})\b",
+                     re.IGNORECASE)
+    m = pat.search(text)
+    if m:
+        return m.group(1)
+    # Variant: 'sectorcode' / 'bedrijfscode'
+    pat2 = re.compile(r"(?:sectorcode|bedrijfscode)[\s\-:.]*(\d{4,5})\b",
+                      re.IGNORECASE)
+    m = pat2.search(text)
+    if m:
+        return m.group(1)
+    return None
+
+
+# %%
+# =============================================================================
+# Per-site verwerking: crawl + extractie + log
+# =============================================================================
+
+@dataclass
+class SiteResult:
+    """Verzamelt extractieresultaten en log-info voor één burgerinitiatief."""
+    naam: str
+    url: str
+    extracted: dict[str, str] = field(default_factory=dict)
+    visited_pages: list[str] = field(default_factory=list)
+    found_fields: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+def _all_text(crawl: CrawlResult) -> str:
+    """Combineer tekst van alle pagina's en PDF's tot één doorzoekbare blob."""
+    return "\n".join(list(crawl.pages.values()) + list(crawl.pdfs.values()))
+
+
+def process_site(naam: str, url: str) -> SiteResult:
+    """Crawl één site en extraheer alle gevraagde velden."""
+    result = SiteResult(naam=naam, url=url)
+    if not url:
+        result.errors.append("Geen URL opgegeven")
+        return result
+
+    log.info("→ %s  (%s)", naam, url)
+    try:
+        crawl = crawl_site(url)
+    except Exception as e:                            # noqa: BLE001
+        log.error("Crawl-fout voor %s: %s", url, e)
+        result.errors.append(f"Crawl: {e}")
+        return result
+
+    result.visited_pages = list(crawl.pages.keys()) + list(crawl.pdfs.keys())
+    result.errors.extend(crawl.errors)
+
+    text_all = _all_text(crawl)
+    if not text_all:
+        result.errors.append("Geen content opgehaald")
+        # Alle nieuwe kolommen blijven leeg / Onbekend
+        for col in NEW_COLUMNS:
+            result.extracted[col] = "" if col not in (
+                "Exclusief voor leden", "Winstoogmerk", "Vrijwillig"
+            ) else "Onbekend"
+        result.extracted["KVK van website"] = "Nee"
+        result.extracted["RSIN van website"] = "Nee"
+        result.extracted["Jaarverslag"] = "Niet gevonden"
+        result.extracted["Opmerking"] = "Geen content opgehaald (site offline of geblokkeerd?)"
+        return result
+
+    # Tekst alleen van website-HTML — voor 'KvK van website' / 'RSIN van website'
+    text_website_only = "\n".join(crawl.pages.values())
+
+    # Extracteer alle velden
+    kvk = extract_kvk(text_all)
+    rsin = extract_rsin(text_all)
+    btw = extract_btw(text_all)
+    kvk_on_website = extract_kvk(text_website_only) is not None
+    rsin_on_website = extract_rsin(text_website_only) is not None
+
+    members_only = extract_members_only(text_all)
+    winstoogmerk = extract_winstoogmerk(text_all)
+    vrijwillig = extract_volunteers(text_all)
+    jaarverslag = extract_jaarverslag(crawl)
+    werkgebied = extract_werkgebied(text_all)
+    sectorcode = extract_sectorcode(text_all)
+    vestigingsplaats = extract_vestigingsplaats(text_all)
+
+    # RSIN/BTW-kolom: combineer beide indien gevonden, anders wat er is.
+    rsin_btw_value = ""
+    parts = []
+    if rsin:
+        parts.append(f"RSIN: {rsin}")
+    if btw:
+        parts.append(f"BTW: {btw}")
+    rsin_btw_value = " | ".join(parts)
+
+    result.extracted = {
+        "KvK-Nummer": kvk or "",
+        "RSIN/BTW nummer": rsin_btw_value,
+        "RSIN": rsin or "",
+        "Exclusief voor leden": members_only,
+        "Winstoogmerk": winstoogmerk,
+        "Opmerking": "",   # vullen we hieronder met wat er ontbreekt
+        "Jaarverslag": jaarverslag or "Niet gevonden",
+        "Werkgebied": werkgebied or "",
+        "Sectorcode": sectorcode or "",
+        "Vestigingsplaats": vestigingsplaats or "",
+        "Vrijwillig": vrijwillig,
+        "KVK van website": "Ja" if kvk_on_website else "Nee",
+        "RSIN van website": "Ja" if rsin_on_website else "Nee",
+    }
+
+    # Bouw Opmerking met wat ontbreekt
+    missing: list[str] = []
+    if not kvk:
+        missing.append("KvK-nummer")
+    if not rsin and not btw:
+        missing.append("RSIN/BTW")
+    if not jaarverslag:
+        missing.append("jaarverslag")
+    if not vestigingsplaats:
+        missing.append("vestigingsplaats")
+    if not werkgebied:
+        missing.append("werkgebied")
+    if not sectorcode:
+        missing.append("SBI-code (zelden op website vermeld)")
+    if missing:
+        result.extracted["Opmerking"] = "Ontbrekend op website: " + ", ".join(missing)
+    else:
+        result.extracted["Opmerking"] = "Alle hoofdvelden gevonden."
+
+    # Found-fields voor de log
+    for col, val in result.extracted.items():
+        if val and val not in ("Onbekend", "Niet gevonden", "Nee"):
+            result.found_fields.append(col)
+
+    return result
+
+
+# %%
+# =============================================================================
+# I/O — Excel/CSV in- en uitlezen
+# =============================================================================
+
+REQUIRED_INPUT_COLS = ("KoepelOrganisatie", "steekproef",
+                       "Naam Burgercollectief", "Website")
+
+
+def load_input(path: str = INPUT_PATH) -> pd.DataFrame:
+    """Laad het input-Excelbestand en valideer de kolommen."""
+    log.info("Inlezen: %s", path)
+    df = pd.read_excel(path, dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+    missing = [c for c in REQUIRED_INPUT_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Verwachte kolom(men) ontbreken in {path}: {missing}. "
+            f"Aanwezig: {list(df.columns)}")
+    # Schoon URLs
+    df["Website"] = df["Website"].map(clean_url)
+    return df
+
+
+def save_output(df_main: pd.DataFrame, df_log: pd.DataFrame,
+                xlsx_path: str = OUTPUT_XLSX,
+                csv_path: str = OUTPUT_CSV) -> None:
+    """Schrijf resultaten naar Excel (2 sheets: 'data' + 'log') en CSV."""
+    log.info("Schrijven: %s", xlsx_path)
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        df_main.to_excel(writer, sheet_name="data", index=False)
+        df_log.to_excel(writer, sheet_name="log", index=False)
+        # Kolombreedte automatisch ruim instellen (cap op 60)
+        for sheet_name, df in (("data", df_main), ("log", df_log)):
+            ws = writer.sheets[sheet_name]
+            for i, col in enumerate(df.columns, start=1):
+                max_len = max(
+                    [len(str(col))] +
+                    [min(60, len(str(v))) for v in df[col].head(200).tolist()
+                     if v is not None]
+                )
+                ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = (
+                    min(60, max(12, max_len + 2)))
+    log.info("Schrijven: %s", csv_path)
+    df_main.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+
+# %%
+# =============================================================================
+# Main — orchestratie
+# =============================================================================
+
+def run_pipeline(df_input: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Verwerk alle rijen in `df_input` en geef (main_df, log_df) terug."""
+    df = df_input.copy()
+    for col in NEW_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    log_rows: list[dict] = []
+
+    iterator = tqdm(df.iterrows(), total=len(df), desc="Initiatieven", unit="site")
+    for idx, row in iterator:
+        naam = str(row.get("Naam Burgercollectief", "") or "").strip()
+        url = str(row.get("Website", "") or "").strip()
+        if not url:
+            log.warning("Rij %d (%s): geen URL — overgeslagen", idx, naam)
+            log_rows.append({
+                "Naam Burgercollectief": naam, "Website": url,
+                "Pagina's bezocht": 0, "Pagina's lijst": "",
+                "Velden gevonden": "", "Foutmeldingen": "Geen URL",
+            })
+            continue
+        try:
+            res = process_site(naam, url)
+        except Exception as e:                        # noqa: BLE001
+            log.error("Onverwachte fout bij %s: %s", naam, e)
+            log_rows.append({
+                "Naam Burgercollectief": naam, "Website": url,
+                "Pagina's bezocht": 0, "Pagina's lijst": "",
+                "Velden gevonden": "", "Foutmeldingen": f"Fataal: {e}",
+            })
+            continue
+
+        for col, val in res.extracted.items():
+            df.at[idx, col] = val
+
+        log_rows.append({
+            "Naam Burgercollectief": naam,
+            "Website": url,
+            "Pagina's bezocht": len(res.visited_pages),
+            "Pagina's lijst": " | ".join(res.visited_pages[:30]),
+            "Velden gevonden": ", ".join(res.found_fields),
+            "Foutmeldingen": " | ".join(res.errors[:10]),
+        })
+
+    # Sorteer kolomvolgorde: oorspronkelijke + nieuwe (in gevraagde volgorde)
+    ordered = list(REQUIRED_INPUT_COLS) + list(NEW_COLUMNS)
+    # Extra kolommen uit input behouden achteraan
+    extras = [c for c in df.columns if c not in ordered]
+    df = df[[c for c in ordered if c in df.columns] + extras]
+
+    df_log = pd.DataFrame(log_rows)
+    return df, df_log
+
+
+def main() -> None:
+    """Lees input, draai pipeline, schrijf output. Sluit playwright netjes af."""
+    try:
+        df_input = load_input(INPUT_PATH)
+        log.info("Aantal initiatieven: %d", len(df_input))
+        df_out, df_log = run_pipeline(df_input)
+        save_output(df_out, df_log)
+        log.info("Klaar. %d rijen verwerkt.", len(df_out))
+    finally:
+        PW_FETCHER.close()
+
+
+# %%
+# =============================================================================
+# Test-runner — handig om snel te valideren zonder Excel-input
+# =============================================================================
+
+TEST_URLS: list[tuple[str, str]] = [
+    ("Boschgaard", "https://www.boschgaard.nl"),
+    ("CW Capelle", "https://www.cwcapelle.nl"),
+    ("Wonen in de Symfonie", "https://www.wonenindesymfonie.nl"),
+    ("Ecodorp Zuiderveld", "https://www.ecodorpzuiderveld.nl"),
+    ("Knarrenhof", "https://www.knarrenhof.nl"),
+    ("Landgoed Berkenbosch", "https://www.landgoedberkenbosch.nl"),
+]
+
+
+def run_test_set(urls: list[tuple[str, str]] = TEST_URLS) -> pd.DataFrame:
+    """Draai de pipeline op een mini-testset (zonder Excel-input).
+
+    Handig om de extractielogica te valideren voordat je de volledige batch
+    draait. Schrijft resultaten naar `test_output.xlsx`/`.csv`.
+    """
+    rows = [{
+        "KoepelOrganisatie": "TEST",
+        "steekproef": "test",
+        "Naam Burgercollectief": naam,
+        "Website": url,
+    } for naam, url in urls]
+    df_in = pd.DataFrame(rows)
+    df_in["Website"] = df_in["Website"].map(clean_url)
+    try:
+        df_out, df_log = run_pipeline(df_in)
+        save_output(df_out, df_log,
+                    xlsx_path="test_output.xlsx",
+                    csv_path="test_output.csv")
+        return df_out
+    finally:
+        PW_FETCHER.close()
+
+
+# %%
+if __name__ == "__main__":
+    # Standaard: testset draaien als er geen burgerinitiatieven.xlsx is.
+    if "--test" in sys.argv or not Path(INPUT_PATH).exists():
+        if not Path(INPUT_PATH).exists():
+            log.info("Geen %s gevonden — testset draaien.", INPUT_PATH)
+        run_test_set()
+    else:
+        main()

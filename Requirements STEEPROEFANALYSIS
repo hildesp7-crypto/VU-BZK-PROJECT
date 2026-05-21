@@ -1,0 +1,11 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+pdfplumber>=0.10.0
+tldextract>=5.0.0
+tqdm>=4.66.0
+# Optioneel — alleen nodig als USE_PLAYWRIGHT_FALLBACK = True
+playwright>=1.40.0
+ 

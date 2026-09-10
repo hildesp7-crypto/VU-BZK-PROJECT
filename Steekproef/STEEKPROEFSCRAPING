@@ -48,7 +48,7 @@ from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 from urllib3.util.retry import Retry
 
-# Optionele dependencies — script blijft werkbaar als ze ontbreken.
+# Optionele dependencies. Script blijft werkbaar als ze ontbreken.
 try:
     import pdfplumber
     HAS_PDFPLUMBER = True
@@ -65,7 +65,7 @@ except ImportError:
 # %%
 # =============================================================================
 # CONFIG — alle instelbare parameters op één plek
-# =============================================================================
+
 
 INPUT_PATH: str = "burgerinitiatieven.xlsx"
 OUTPUT_XLSX: str = "burgerinitiatieven_gescraped.xlsx"
@@ -119,7 +119,6 @@ NEW_COLUMNS: tuple[str, ...] = (
 # %%
 # =============================================================================
 # Logging — INFO naar stdout, DEBUG naar bestand
-# =============================================================================
 
 def setup_logging(log_file: str = LOG_FILE) -> logging.Logger:
     """Configureer logging: INFO naar console, DEBUG naar `scrape.log`."""
@@ -154,7 +153,7 @@ if not HAS_PLAYWRIGHT and USE_PLAYWRIGHT_FALLBACK:
 # %%
 # =============================================================================
 # Nederlandse gemeenten + provincies + regio's (voor Werkgebied/Vestigingsplaats)
-# =============================================================================
+
 # Lijst van huidige Nederlandse gemeenten (2024). Niet 100% volledig maar dekt
 # de overgrote meerderheid. Aanvullen kan vrij.
 
@@ -268,7 +267,7 @@ _REGIOS_LOOKUP: dict[str, str] = {r.lower(): r for r in NL_REGIOS}
 # %%
 # =============================================================================
 # URL-utilities
-# =============================================================================
+
 
 def clean_url(raw: str) -> str:
     """Strip Markdown-link-syntax en voeg schema toe als dat ontbreekt.
@@ -317,7 +316,7 @@ def hash_url(url: str) -> str:
 # %%
 # =============================================================================
 # Cache — bestand-gebaseerd, per domein
-# =============================================================================
+
 
 def cache_paths(url: str) -> tuple[Path, Path]:
     """Geef (content_path, meta_path) terug voor een gegeven URL."""
@@ -354,7 +353,7 @@ def cache_put(url: str, content: bytes) -> None:
 # %%
 # =============================================================================
 # HTTP-sessie met retries + robots.txt
-# =============================================================================
+
 
 _robots_cache: dict[str, Optional[robotparser.RobotFileParser]] = {}
 _last_fetch_per_domain: dict[str, float] = {}
@@ -422,7 +421,7 @@ def polite_wait(url: str) -> None:
 # %%
 # =============================================================================
 # Fetch — met cache, robots.txt, delay, retries
-# =============================================================================
+
 
 @dataclass
 class FetchResult:
@@ -490,7 +489,6 @@ def fetch(url: str, use_cache: bool = True) -> FetchResult:
 # %%
 # =============================================================================
 # Playwright-fallback voor JS-zware sites
-# =============================================================================
 
 class PlaywrightFetcher:
     """Lazy-initialised playwright browser; één instantie hergebruiken."""
@@ -573,7 +571,7 @@ def fetch_smart(url: str) -> FetchResult:
 # %%
 # =============================================================================
 # Crawler — BFS tot max diepte, prioriteit voor relevante paden
-# =============================================================================
+
 
 @dataclass
 class CrawlResult:
@@ -709,7 +707,7 @@ def crawl_site(start_url: str,
 # %%
 # =============================================================================
 # PDF-extractie
-# =============================================================================
+
 
 def extract_text_from_pdf(result: FetchResult) -> str:
     """Extraheer tekst uit een PDF-FetchResult met pdfplumber."""
@@ -731,7 +729,7 @@ def extract_text_from_pdf(result: FetchResult) -> str:
 # %%
 # =============================================================================
 # Field-extractors — één functie per gevraagd veld
-# =============================================================================
+
 
 def _context_window(text: str, match: re.Match, before: int = 80,
                     after: int = 80) -> str:
@@ -1004,7 +1002,7 @@ def extract_sectorcode(text: str) -> Optional[str]:
 # %%
 # =============================================================================
 # Per-site verwerking: crawl + extractie + log
-# =============================================================================
+
 
 @dataclass
 class SiteResult:
@@ -1127,7 +1125,7 @@ def process_site(naam: str, url: str) -> SiteResult:
 # %%
 # =============================================================================
 # I/O — Excel/CSV in- en uitlezen
-# =============================================================================
+
 
 REQUIRED_INPUT_COLS = ("KoepelOrganisatie", "steekproef",
                        "Naam Burgercollectief", "Website")
@@ -1174,7 +1172,7 @@ def save_output(df_main: pd.DataFrame, df_log: pd.DataFrame,
 # %%
 # =============================================================================
 # Main — orchestratie
-# =============================================================================
+
 
 def run_pipeline(df_input: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Verwerk alle rijen in `df_input` en geef (main_df, log_df) terug."""
@@ -1244,8 +1242,8 @@ def main() -> None:
 
 # %%
 # =============================================================================
-# Test-runner — handig om snel te valideren zonder Excel-input
-# =============================================================================
+# Test-runner. Handig om snel te valideren zonder Excel-input
+
 
 TEST_URLS: list[tuple[str, str]] = [
     ("Boschgaard", "https://www.boschgaard.nl"),

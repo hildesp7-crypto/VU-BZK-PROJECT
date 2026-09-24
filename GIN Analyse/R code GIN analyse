@@ -1,1 +1,1553 @@
+---
+title: "GIN & buurtparticipatie: dataset voorbereiden en analyseren"
+subtitle: "Lineair waarschijnlijkheidsmodel (survey-gewogen OLS)"
+author: "Hilde Spaan"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Reproducibility: the bootstrap in the mediation models and the imputation
+# below both depend on this seed. Never remove it.
+set.seed(20260917)
+```
+
+# Over deze versie
+
+Deze versie schat de regressiemodellen als **lineair waarschijnlijkheidsmodel (LPM)**
+in plaats van logistisch. De coëfficiënten zijn daarmee verschillen in de kans op
+deelname op een 0–1 schaal: `0,09` betekent negen procentpunt. Dat maakt ze
+vergelijkbaar tussen de vijf uitkomstmaten, wat bij logit-coëfficiënten niet
+zonder meer kan (de schaal wordt per model geïdentificeerd door de restvariantie).
+Het sluit bovendien aan bij de mediatiemodellen, die de dichotome uitkomst al
+numeriek behandelen.
+
+De schatter staat op één plek, in `FAMILIE` hieronder. Zet die op
+`quasibinomial()` en het hele script draait weer logistisch, inclusief tabellen
+en voetnoten.
+
+**Volgorde van het script**
+
+1. Kolommen hernoemen (alleen naamgeving, geen hercodering)
+2. Onafhankelijke en controlevariabelen hercoderen
+3. Cronbach's alpha en schaalconstructie
+4. Afhankelijke variabelen construeren
+5. Uitvalanalyse en single imputation
+6. Survey-design
+7. Beschrijvende statistiek en bivariate vergelijkingen (gewogen)
+8. Regressiemodellen (gewogen LPM)
+9. Mediatieanalyse (lavaan, bootstrapped)
+10. Modeldiagnostiek: Wald-toetsen en (G)VIF
+11. Word-export van alle tabellen
+
+# Instellingen en packages
+
+```{r config}
+# ---- Estimator ------------------------------------------------------------
+# gaussian()      = linear probability model (this version)
+# quasibinomial() = logistic regression (the previous version)
+FAMILIE <- gaussian()
+
+LPM <- FAMILIE$family == "gaussian"
+
+# ---- Scale construction ---------------------------------------------------
+# Minimum fraction of items a respondent must have answered before a scale
+# score is computed. 0 reproduces the earlier behaviour (rowMeans with
+# na.rm = TRUE: one answered item is enough). At 0 the mis_* dummies are
+# almost never 1, because a score is only NA when ALL items are missing —
+# see the note in section 3.
+MIN_ITEM_FRACTIE <- 0
+
+# ---- Missingness dummies in the models ------------------------------------
+# Under logit, a dummy that perfectly predicts the outcome breaks estimation
+# (quasi-complete separation), so such dummies were dropped. The LPM has no
+# such problem, so all dummies can stay in. TRUE = keep the old exclusion.
+SEPARATIE_UITSLUITEN <- !LPM
+```
+
+```{r packages}
+packages <- c(
+  "readxl", "dplyr", "tidyr", "writexl", "psych", "survey", "lavaan",
+  "car", "flextable", "officer", "here"
+)
+ontbreekt <- setdiff(packages, rownames(installed.packages()))
+if (length(ontbreekt)) {
+  stop(
+    "Deze packages ontbreken: ", paste(ontbreekt, collapse = ", "),
+    ".\nInstalleer ze eenmalig in de console (niet in dit script):\n",
+    "install.packages(c(", paste0('"', ontbreekt, '"', collapse = ", "), "))"
+  )
+}
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+```{r paths}
+# No setwd(). Paths are relative to the project root, which here::here() finds
+# via the .Rproj file. Put the data in <project>/data and the output in
+# <project>/output.
+basismap   <- "/Users/hildespaan/Documents/1 Werk & onderzoek/Werk/Vrije Universiteit Amsterdam/BZK Project/GIN-analyse"
+data_pad   <- file.path(basismap, "Dataset", "GIN25_BZK2.xlsx")
+uitvoermap <- file.path(basismap, "output")
+
+dir.create(uitvoermap, showWarnings = FALSE, recursive = TRUE)
+stopifnot(file.exists(data_pad))
+```
+
+```{r data-inladen}
+data <- readxl::read_excel(data_pad)
+
+dim(data)
+```
+
+# 1. Kolommen hernoemen
+
+```{r stap1-hernoemen}
+data <- data |>
+  rename(
+    leeftijd            = Age,
+    geslacht_raw        = Gender,
+    opleiding           = `Hoogst gevolgde opleiding`,
+    homeowner           = `homeownership or rental home`,
+    mmarresp            = `marital status`,
+    stedelijkheid_wonen = `Stedelijkheid woonplaats - Hoe zou u uw woonplaats omschrijven?`,
+    mchldc              = `having children - categories`,
+    mbelong1 = `How close feel to: village, town or city`,
+    mbelong2 = `How close feel to: province`,
+    mbelong3 = `How close feel to: Netherlands`,
+    mbelong4 = `How close feel to: Europe`,
+    mbelong5 = `How close feel to: world`,
+    msocpar1 = `Parental socialization prosocial behavior: my parents were always willing to hel`,
+    msocpar2 = `Parental socialization prosocial behavior: my parents always emphasized how impo`,
+    msocpar3 = `Parental socialization prosocial behavior: my parents couldnt care less if I hel`,
+    msocpar4 = `Parental socialization prosocial behavior: I learned from my parents how importa`,
+    msocpar5 = `Parental socialization prosocial behavior: I often talked to my parents about ho`,
+    msocpar6 = `Parental socialization prosocial behavior: If my parents were asked to donate, t`,
+    religie_lid = `Belong to religious denomination? - nominal`,
+    religie     = `Religious community belonging to`,
+    netto_huishoudinkomen  = `Nett annual household income`,
+    gezondheid             = `What do you generally think of your health?`,
+    vrije_tijd             = `how much leisure time`,
+    social_media_dagelijks = `active on social media multiple times a day yes or no`,
+    politieke_voorkeur     = `political preferences left or right`,
+    ooit_nonprofit         = `ever worked for nonprofit`,
+    mvask2                 = `Have you ever been asked to do voluntary work in the past 2 years?`,
+    # Mental Health Inventory (MHI-5)
+    mhi1 = `mental health inventory 5: felt very nervous in past four weeks`,
+    mhi2 = `mental health inventory 5: felt so down that nothing could cheer me up`,
+    mhi3 = `mental health inventory 5: felt calm and relaxed`,
+    mhi4 = `mental health inventory 5: felt depressed and sad`,
+    mhi5 = `mental health inventory 5: felt happy`,
+    # Burgerlijke werkzaamheid (civic efficacy)
+    ce1 = `I can have a positive impact on social problems`,
+    ce2 = `Realistically, I can do little to bring about changes in our society`,
+    ce3 = `I have confidence in my ability to help others`,
+    ce4 = `I can make a difference in my community`,
+    ce5 = `None of us can make a differenc ein the lives of the less fortunate`,
+    # Gegeneraliseerd vertrouwen en vertrouwen in de overheid
+    trust1 = `Statement: In general, most people can be trusted`,
+    trust2 = `Statement Reversed: You cant be too careful in your dealings with people`,
+    vertrouwen_regering_raw = `How much confidence do you have in the government of the Netherlands?`,
+    # Service motivation
+    msm1 = `Doing well financially is definitely more important to me than doing good deeds`,
+    msm2 = `I would say that the main purposes of work are to improve society through my car`,
+    msm3 = `The education and knowledge that I have gained should be used to serve others`,
+    msm4 = `I feel a deep conviction in my career to achieve purposes that are beyond my own`,
+    msm5 = `I am not willing to work for companies with a bad reputation on corporate social`,
+    msm6 = `Its important to me to work for a social and climate friendly employer`,
+    # Vrijwilligersnorm
+    mvnorm1 = `Statement (Volunteering): In my social environment it is perceived as self-evide...69`,
+    mvnorm2 = `Statement(Volunteering): Everyboy should volunteering at least once in their lif`,
+    mvnorm3 = `Statement (Volunteering): Everybody should donate to charitable causes`,
+    # Buurtactiviteiten
+    actcit_pubsp     = `Active citizenship: Maintenance of public space`,
+    actcit_comc      = `Active citizenship: Help (manage or exploitation) at a community center`,
+    actcit_energ     = `Active citizenship: Taking energy-saving measures together`,
+    actcit_over      = `Active citizenship: Oversee the neighborhood together`,
+    actcit_socact    = `Active citizenship: Organization of a social activity`,
+    actcit_klus      = `Active citizenship: Small jobs for a neighbor`,
+    actcit_zorg      = `Active citizenship: Assist each other with health problems`,
+    actcit_bedr      = `Active citizenship: Support for a social enterprise`,
+    actcit_maat      = `Active citizenship: Support for an action for social problems in the neighborhoo`,
+    actcit_other     = `Active citizenship: other`,
+    actcit_buurtverg = `Active citizenship: Visiting a meeting of the local government, house agency or`,
+    # Politieke participatie
+    polpar_ben   = `Political participation: contacted political party or organisation`,
+    polpar_med   = `Political participation: contacted media`,
+    polpar_cont  = `Political participation: contacted politician or civil servan`,
+    polpar_act   = `Political participation: participation in action group`,
+    polpar_prot  = `Political participation: attended demonstration`,
+    polpar_hand  = `Political participation: signed petition`,
+    polpar_disc  = `Political participation: political discussion on internet`,
+    polpar_boyc  = `Political participation: boycot products`,
+    polpar_other = `Political participation: other`,
+    polpar_stem  = `Political participation: voting`,
+    # Formeel vrijwilligerswerk
+    mvyou2 = `Volunteer in: Youth and community work (new categories)`,
+    mvedu2 = `Volunteer in: Education (new categories)`,
+    mvhl2  = `Volunteer in: Care or nursing (new categories)`,
+    mvsr2  = `Volunteer in: Sports (new categories)`,
+    mvca2  = `Volunteer in: Culture (new categories)`,
+    mvrec2 = `Volunteer in: Hobby, recreation (new categories)`,
+    mvrel2 = `Volunteer in: Religion (e.g. church/mosque/temple/synagogue) (new categories)`,
+    mvtpo2 = `Volunteer in: Politics or trade union (new categories)`,
+    mvsoc2 = `Volunteer in: Social care (new categories)`,
+    mvnei2 = `Volunteer in: Neighbourhood (new categories)`,
+    mvea2  = `Volunteer in: Environment, nature or animal welfare (new categories)`,
+    mvria  = `Volunteer in: Refugee work, human rightts, developmental aid (new categories)`,
+    mvoth2 = `Volunteer in: Other (new categories)`,
+    # Informele hulp
+    inform_huishouden       = `Informal helping: Housekeeping`,
+    inform_kinderopvang     = `Informal helping: Childcare`,
+    inform_pers_zorg        = `Informal helping:Personal care`,
+    inform_administratie    = `Informal Helping: Administrative organization`,
+    inform_begeleiding      = `Informal Helping: Accompanying`,
+    inform_emotionele_steun = `Informal Helping: Emotional support`,
+    inform_verpleging       = `Informal Helping: Nursing`,
+    inform_training         = `Informal Helping: Training`,
+    inform_onderhoud        = `Informal Helping: Maintenance work`,
+    inform_gezelschap       = `Informal Helping: Keeping company`,
+    inform_overig           = `Informal Helping: Other activities`,
+    # Online informeel helpen
+    online_informeel_kennis     = `Online informal volunteering: Contribution to knowledge-sharing website`,
+    online_informeel_review     = `Online informal volunteering: Posted a review`,
+    online_informeel_forum      = `Online informal volunteering: Contribution to forum`,
+    online_informeel_video      = `Online informal volunteering: Posted informative video`,
+    online_informeel_podcast    = `Online informal volunteering: Released informative podcast`,
+    online_informeel_opensource = `Online informal volunteering: Contribution to open source projects`,
+    online_informeel_hulp       = `Online informal volunteering: Offered help online`,
+    online_informeel_product    = `Online informal volunteering: Offered free product via sharing platform`,
+    online_informeel_modforum   = `Online informal volunteering: Organize, moderate or update a forum, blog or onli`,
+    online_informeel_community  = `Online informal volunteering: Organize or moderate an online community`,
+    online_informeel_event      = `Online informal volunteering: Organize an event and invite participants`,
+    online_informeel_overig     = `Online informal volunteering: Other`,
+    gewicht = `weight on individual level`
+  )
+```
+
+# 2. Hercoderingen
+
+```{r stap2-hercoderingen}
+data <- data |>
+  mutate(
+    # ---- Leeftijd ----
+    leeftijdsgroep = factor(
+      case_when(
+        leeftijd >= 18 & leeftijd <= 34 ~ "Jongvolwassen (18-34)",
+        leeftijd >= 35 & leeftijd <= 64 ~ "Middelbaar volwassen (35-64)",
+        leeftijd >= 65                  ~ "Senioren (65+)"
+      ),
+      levels = c("Jongvolwassen (18-34)", "Middelbaar volwassen (35-64)", "Senioren (65+)")
+    ),
+
+    # ---- Geslacht ----
+    # A three-category variable must not enter the models as a number: coded
+    # 1/2/3 it would impose equal steps from man to vrouw to overig. As a factor
+    # with man as reference, the coefficient labelled "Vrouw" is the
+    # man-vrouw difference, which is what the text claims.
+    geslacht = factor(
+      case_when(
+        geslacht_raw == 1 ~ "Man",
+        geslacht_raw == 2 ~ "Vrouw",
+        geslacht_raw == 3 ~ "Overig"
+      ),
+      levels = c("Man", "Vrouw", "Overig")
+    ),
+
+    # ---- Religie ----
+    religieus_cat = factor(
+      case_when(
+        religie == 1 ~ "Protestants",
+        religie == 2 ~ "Katholiek",
+        TRUE         ~ "Overig"
+      ),
+      levels = c("Overig", "Protestants", "Katholiek")
+    ),
+    religieus = case_when(
+      religie_lid == 1 ~ 1,
+      religie_lid == 0 ~ 0
+    ),
+
+    # ---- Koopwoning ----
+    koopwoning = case_when(
+      homeowner == 4               ~ 1,
+      homeowner %in% c(1, 2, 3, 5) ~ 0
+      # 997/999 fall through to NA
+    ),
+
+    # ---- Opleiding ----
+    opleidingsniveau = factor(
+      case_when(
+        opleiding %in% 1:3 ~ "Laag",
+        opleiding %in% 4:5 ~ "Midden",
+        opleiding %in% 6:7 ~ "Hoog"
+      ),
+      levels = c("Laag", "Midden", "Hoog")
+    ),
+
+    # ---- Burgerlijke staat ----
+    burgerlijke_staat = factor(
+      case_when(
+        mmarresp %in% c(1, 5, 6) ~ "Alleen",   # incl. gescheiden en verweduwd
+        mmarresp == 4            ~ "Gehuwd",
+        mmarresp == 2            ~ "Partner samenwonend",
+        mmarresp == 3            ~ "Partner niet-samenwonend"
+      ),
+      levels = c("Alleen", "Gehuwd", "Partner samenwonend", "Partner niet-samenwonend")
+    ),
+
+    # ---- Stedelijkheid ----
+    # Explicit levels with Dorpen first, so the reference category matches
+    # what the paper says instead of depending on alphabetical order.
+    stedelijkheid_cat = factor(
+      case_when(
+        stedelijkheid_wonen == 1      ~ "Grote steden",
+        stedelijkheid_wonen == 2      ~ "Kleine steden",
+        stedelijkheid_wonen %in% c(3, 4) ~ "Dorpen"
+      ),
+      levels = c("Dorpen", "Kleine steden", "Grote steden")
+    ),
+
+    # ---- Vertrouwen in de overheid ----
+    vertrouwen_regering = if_else(
+      as.numeric(vertrouwen_regering_raw) %in% 1:5,
+      as.numeric(vertrouwen_regering_raw),
+      NA_real_
+    ),
+
+    # ---- Kinderen ----
+    kinderen = case_when(
+      mchldc == 1            ~ 0,
+      mchldc %in% c(2, 3, 4) ~ 1
+    ),
+
+    # ---- Gevraagd voor vrijwilligerswerk ----
+    mvask2_dummy = case_when(
+      mvask2 == 1 ~ 1,
+      mvask2 == 0 ~ 0
+    ),
+
+    # ---- Lokale betrokkenheid (mbelong1, omgekeerd) ----
+    lokale_betrokkenheid = 6 - mbelong1
+  )
+```
+
+```{r stap2-inkomen}
+# Income quintiles. Note: these cut-offs are UNWEIGHTED sample quantiles, as in
+# the earlier version. The weighted alternative is one line below; switching
+# changes the group sizes and therefore every income coefficient, so decide
+# once and say in the paper which one you used.
+inkomen_p20 <- quantile(data$netto_huishoudinkomen, 0.20, na.rm = TRUE)
+inkomen_p80 <- quantile(data$netto_huishoudinkomen, 0.80, na.rm = TRUE)
+
+# Weighted alternative:
+# inkomen_p20 <- Hmisc::wtd.quantile(data$netto_huishoudinkomen, data$gewicht, 0.20, na.rm = TRUE)
+# inkomen_p80 <- Hmisc::wtd.quantile(data$netto_huishoudinkomen, data$gewicht, 0.80, na.rm = TRUE)
+
+data <- data |>
+  mutate(
+    inkomen_cat = factor(
+      case_when(
+        is.na(netto_huishoudinkomen)            ~ NA_character_,
+        netto_huishoudinkomen <= inkomen_p20    ~ "Laag (onderste 20%)",
+        netto_huishoudinkomen >  inkomen_p80    ~ "Hoog (bovenste 20%)",
+        TRUE                                    ~ "Midden (middelste 60%)"
+      ),
+      levels = c("Laag (onderste 20%)", "Midden (middelste 60%)", "Hoog (bovenste 20%)")
+    )
+  )
+
+# Check the recodings before moving on.
+data |> count(leeftijdsgroep, .drop = FALSE)
+data |> count(geslacht, .drop = FALSE)
+data |> count(opleidingsniveau, .drop = FALSE)
+data |> count(inkomen_cat, .drop = FALSE)
+data |> count(stedelijkheid_cat, .drop = FALSE)
+```
+
+# 3. Cronbach's alpha en schaalconstructie
+
+De schalen zijn gemiddelden van de items, met negatief geformuleerde items
+omgekeerd vóór de berekening.
+
+**Let op bij `MIN_ITEM_FRACTIE = 0`:** een schaalscore is dan alleen `NA` wanneer
+*alle* items ontbreken. De `mis_*`-dummy's die op `is.na(score)` gebaseerd zijn,
+staan daardoor bijna nooit op 1, en controleren dus vrijwel niets. Wil je ze
+laten doen waarvoor ze bedoeld zijn, zet `MIN_ITEM_FRACTIE` op `0.5`. Dat
+verandert wel de schaalscores en daarmee alle beschrijvende cijfers.
+
+```{r stap3-helpers}
+SCHAAL_MIN <- 1
+SCHAAL_MAX <- 5
+
+reverse_item <- function(x) (SCHAAL_MIN + SCHAAL_MAX) - x
+
+# Scale score with an explicit rule for partial non-response.
+schaalscore <- function(..., min_fractie = MIN_ITEM_FRACTIE) {
+  m <- cbind(...)
+  n_geldig <- rowSums(!is.na(m))
+  score    <- rowMeans(m, na.rm = TRUE)
+  score[n_geldig < ceiling(min_fractie * ncol(m))] <- NA_real_
+  score[n_geldig == 0] <- NA_real_
+  score
+}
+```
+
+```{r stap3-alpha}
+schaal_definities <- list(
+  Betrokkenheid = list(
+    items = c("mbelong2", "mbelong3", "mbelong4", "mbelong5"),
+    keys  = c(-1, -1, -1, -1)
+  ),
+  `Burgerlijke werkzaamheid` = list(
+    items = c("ce1", "ce2", "ce3", "ce4", "ce5"),
+    keys  = c(1, -1, 1, 1, -1)
+  ),
+  `Socialisatie ouders` = list(
+    items = c("msocpar1", "msocpar2", "msocpar3", "msocpar4", "msocpar5", "msocpar6"),
+    keys  = c(1, 1, -1, 1, 1, 1)
+  ),
+  `Gegeneraliseerd vertrouwen` = list(
+    items = c("trust1", "trust2"),
+    keys  = c(1, -1)
+  ),
+  `Mentale gezondheid (MHI-5)` = list(
+    items = c("mhi1", "mhi2", "mhi3", "mhi4", "mhi5"),
+    keys  = c(-1, -1, 1, -1, 1)
+  ),
+  `Service motivation` = list(
+    items = c("msm1", "msm2", "msm3", "msm4", "msm5", "msm6"),
+    keys  = c(-1, 1, 1, 1, 1, 1)
+  ),
+  Vrijwilligersnorm = list(
+    # Three items in the data. Bijlage 1 of the paper says four — check which
+    # is right and make the two match.
+    items = c("mvnorm1", "mvnorm2", "mvnorm3"),
+    keys  = c(1, 1, 1)
+  )
+)
+
+alpha_resultaten <- lapply(schaal_definities, function(s) {
+  psych::alpha(as.data.frame(data[, s$items]), keys = s$keys, warnings = FALSE)
+})
+
+# Report alpha alongside the item-rest correlations, so you can see why a scale
+# is weak before deciding to drop an item.
+alpha_overzicht <- lapply(names(alpha_resultaten), function(nm) {
+  a <- alpha_resultaten[[nm]]
+  data.frame(
+    schaal      = nm,
+    n_items     = length(schaal_definities[[nm]]$items),
+    n_omgekeerd = sum(schaal_definities[[nm]]$keys == -1),
+    raw_alpha   = round(a$total$raw_alpha, 2),
+    std_alpha   = round(a$total$std.alpha, 2),
+    gem_r_drop  = round(mean(a$item.stats$r.drop, na.rm = TRUE), 2),
+    row.names   = NULL
+  )
+}) |> bind_rows()
+
+alpha_overzicht
+
+# Item-rest correlations per scale, for the appendix.
+lapply(alpha_resultaten, function(a) round(a$item.stats[, c("r", "r.drop")], 2))
+```
+
+```{r stap3-scores}
+data <- data |>
+  mutate(
+    betrokkenheid_score = schaalscore(
+      reverse_item(mbelong2), reverse_item(mbelong3),
+      reverse_item(mbelong4), reverse_item(mbelong5)
+    ),
+    civic_efficacy_score = schaalscore(
+      ce1, reverse_item(ce2), ce3, ce4, reverse_item(ce5)
+    ),
+    socialisatie_ouders_score = schaalscore(
+      msocpar1, msocpar2, reverse_item(msocpar3), msocpar4, msocpar5, msocpar6
+    ),
+    gen_trust_score = schaalscore(
+      trust1, reverse_item(trust2)
+    ),
+    mentale_gezondheid_score = schaalscore(
+      reverse_item(mhi1), reverse_item(mhi2), mhi3, reverse_item(mhi4), mhi5
+    ),
+
+    service_motivation_score = schaalscore(
+      reverse_item(msm1), msm2, msm3, msm4, msm5, msm6
+    ),
+    vrijwilligersnorm_score = schaalscore(
+      mvnorm1, mvnorm2, mvnorm3
+    )
+  )
+
+summary(data[, c("betrokkenheid_score", "civic_efficacy_score",
+                 "socialisatie_ouders_score", "gen_trust_score",
+                 "mentale_gezondheid_score", 
+                 "service_motivation_score", "vrijwilligersnorm_score",
+                 "lokale_betrokkenheid", "vertrouwen_regering")])
+```
+
+# 4. Afhankelijke variabelen
+
+```{r stap4-itemsets}
+deelgenomen <- function(x) dplyr::coalesce(x == 1, FALSE)
+
+activity_vars <- c(
+  "actcit_pubsp", "actcit_comc", "actcit_energ", "actcit_over",
+  "actcit_socact", "actcit_klus", "actcit_zorg", "actcit_bedr",
+  "actcit_maat", "actcit_other", "actcit_buurtverg"
+)
+volunteer_vars <- c(
+  "mvyou2", "mvedu2", "mvhl2", "mvsr2", "mvca2", "mvrec2", "mvrel2",
+  "mvtpo2", "mvsoc2", "mvnei2", "mvea2", "mvria", "mvoth2"
+)
+polpar_vars <- c(
+  "polpar_ben", "polpar_med", "polpar_cont", "polpar_act", "polpar_prot",
+  "polpar_hand", "polpar_disc", "polpar_boyc", "polpar_other", "polpar_stem"
+)
+informal_helping_vars <- c(
+  "inform_huishouden", "inform_kinderopvang", "inform_pers_zorg",
+  "inform_administratie", "inform_begeleiding", "inform_emotionele_steun",
+  "inform_verpleging", "inform_training", "inform_onderhoud",
+  "inform_gezelschap", "inform_overig"
+)
+online_informal_vars <- c(
+  "online_informeel_kennis", "online_informeel_review", "online_informeel_forum",
+  "online_informeel_video", "online_informeel_podcast", "online_informeel_opensource",
+  "online_informeel_hulp", "online_informeel_product", "online_informeel_modforum",
+  "online_informeel_community", "online_informeel_event", "online_informeel_overig"
+)
+
+# All item sets must exist before we build sum scores from them.
+alle_itemsets <- c(activity_vars, volunteer_vars, polpar_vars,
+                   informal_helping_vars, online_informal_vars)
+ontbrekende_kolommen <- setdiff(alle_itemsets, names(data))
+if (length(ontbrekende_kolommen)) {
+  stop("Deze kolommen bestaan niet in de data: ",
+       paste(ontbrekende_kolommen, collapse = ", "))
+}
+```
+
+```{r stap4-uitkomsten}
+activity_mat         <- sapply(data[activity_vars],         deelgenomen)
+volunteer_mat        <- sapply(data[volunteer_vars],        deelgenomen)
+polpar_mat           <- sapply(data[polpar_vars],           deelgenomen)
+informal_helping_mat <- sapply(data[informal_helping_vars], deelgenomen)
+online_informal_mat  <- sapply(data[online_informal_vars],  deelgenomen)
+ 
+data <- data |>
+  mutate(
+    # ---- Buurtparticipatie: de primaire uitkomstmaat ----
+    # any_buurtactiviteit = deelname aan minimaal een van de elf activiteiten.
+    # Dit is de variabele die in alle modellen gebruikt wordt.
+    buurtparticipatie_count = rowSums(activity_mat),
+    any_buurtactiviteit     = as.numeric(rowSums(activity_mat) > 0),
+ 
+    # deelname_buurtverg is EEN activiteit: de buurtvergadering/inspraakavond.
+    # Niet verwarren met any_buurtactiviteit; bijlage 1 van het paper
+    # beschrijft deze naam nu ten onrechte als "minimaal 1 buurtactiviteit".
+    deelname_buurtverg = as.numeric(deelgenomen(actcit_buurtverg)),
+ 
+    # ---- Overige participatievormen: uitkomstmaat en voorspeller ----
+    volunteer_any           = as.numeric(rowSums(volunteer_mat) > 0),
+    vrijwilligerswerk_count = rowSums(volunteer_mat),
+ 
+    polpar_any     = as.numeric(rowSums(polpar_mat) > 0),
+    politiek_count = rowSums(polpar_mat),
+ 
+    informal_helping_dummy = as.numeric(rowSums(informal_helping_mat) > 0),
+    informal_helping_count = rowSums(informal_helping_mat),
+ 
+    online_informeel_dummy = as.numeric(rowSums(online_informal_mat) > 0),
+    online_informeel_count = rowSums(online_informal_mat)
+  )
+ 
+# Missingness indicators, computed BEFORE imputation.
+te_imputeren <- c(
+  netto_huishoudinkomen     = "mis_inkomen",
+  gezondheid                = "mis_gezondheid",
+  vrije_tijd                = "mis_vrije_tijd",
+  religie_lid               = "mis_religieus",
+  betrokkenheid_score       = "mis_betrokkenheid",
+  lokale_betrokkenheid      = "mis_lokale_betrok",
+  civic_efficacy_score      = "mis_civic_efficacy",
+  gen_trust_score           = "mis_gen_trust",
+  vertrouwen_regering       = "mis_vertrouwen_reg",
+  mentale_gezondheid_score  = "mis_mentale_gez",
+  empathic_concern_score    = "mis_empathie",
+  service_motivation_score  = "mis_service_mot",
+  vrijwilligersnorm_score   = "mis_vrijwilligersnorm"
+)
+ 
+# Fail loudly and by name if a source column is missing, instead of silently
+# assigning a zero-length vector.
+ontbrekend <- setdiff(names(te_imputeren), names(data))
+if (length(ontbrekend)) {
+  stop("Deze bronkolommen bestaan niet (is sectie 1-3 gedraaid?): ",
+       paste(ontbrekend, collapse = ", "))
+}
+ 
+for (bron in names(te_imputeren)) {
+  data[[te_imputeren[[bron]]]] <- as.integer(is.na(data[[bron]]))
+}
+ 
+# How often is each dummy actually 1? A column of zeros controls for nothing.
+colSums(data[unname(te_imputeren)])
+```
+ 
+```{r stap4-groepen}
+activity_mat         <- sapply(data[activity_vars],         deelgenomen)
+volunteer_mat        <- sapply(data[volunteer_vars],        deelgenomen)
+polpar_mat           <- sapply(data[polpar_vars],           deelgenomen)
+informal_helping_mat <- sapply(data[informal_helping_vars], deelgenomen)
+online_informal_mat  <- sapply(data[online_informal_vars],  deelgenomen)
+ 
+data <- data |>
+  mutate(
+    # ---- Buurtparticipatie: de primaire uitkomstmaat ----
+    # any_buurtactiviteit = deelname aan minimaal een van de elf activiteiten.
+    # Dit is de variabele die in alle modellen gebruikt wordt.
+    buurtparticipatie_count = rowSums(activity_mat),
+    any_buurtactiviteit     = as.numeric(rowSums(activity_mat) > 0),
+ 
+    # deelname_buurtverg is EEN activiteit: de buurtvergadering/inspraakavond.
+    # Niet verwarren met any_buurtactiviteit; bijlage 1 van het paper
+    # beschrijft deze naam nu ten onrechte als "minimaal 1 buurtactiviteit".
+    deelname_buurtverg = as.numeric(deelgenomen(actcit_buurtverg)),
+ 
+    # ---- Overige participatievormen: uitkomstmaat en voorspeller ----
+    volunteer_any           = as.numeric(rowSums(volunteer_mat) > 0),
+    vrijwilligerswerk_count = rowSums(volunteer_mat),
+ 
+    polpar_any     = as.numeric(rowSums(polpar_mat) > 0),
+    politiek_count = rowSums(polpar_mat),
+ 
+    informal_helping_dummy = as.numeric(rowSums(informal_helping_mat) > 0),
+    informal_helping_count = rowSums(informal_helping_mat),
+ 
+    online_informeel_dummy = as.numeric(rowSums(online_informal_mat) > 0),
+    online_informeel_count = rowSums(online_informal_mat)
+  )
+ 
+# Missingness indicators, computed BEFORE imputation.
+te_imputeren <- c(
+  netto_huishoudinkomen     = "mis_inkomen",
+  gezondheid                = "mis_gezondheid",
+  vrije_tijd                = "mis_vrije_tijd",
+  religie_lid               = "mis_religieus",
+  betrokkenheid_score       = "mis_betrokkenheid",
+  lokale_betrokkenheid      = "mis_lokale_betrok",
+  civic_efficacy_score      = "mis_civic_efficacy",
+  gen_trust_score           = "mis_gen_trust",
+  vertrouwen_regering       = "mis_vertrouwen_reg",
+  mentale_gezondheid_score  = "mis_mentale_gez",
+  service_motivation_score  = "mis_service_mot",
+  vrijwilligersnorm_score   = "mis_vrijwilligersnorm"
+)
+ 
+
+ 
+# How often is each dummy actually 1? A column of zeros controls for nothing.
+colSums(data[unname(te_imputeren)])
+```
+
+```{r stap4-groepen}
+controlevars_basis <- c(
+  "leeftijdsgroep", "geslacht", "religieus", "burgerlijke_staat",
+  "kinderen", "gezondheid", "vrije_tijd", "social_media_dagelijks",
+  "ooit_nonprofit", "politieke_voorkeur"
+)
+
+# All missingness dummies that vary are eligible as controls.
+missingness_dummies <- unname(te_imputeren)[colSums(data[unname(te_imputeren)]) > 0]
+
+controlevars <- c(controlevars_basis, missingness_dummies)
+
+kernvar_groepen <- list(
+  ses = c("opleidingsniveau", "inkomen_cat", "koopwoning"),
+  cohesie = c("stedelijkheid_cat", "betrokkenheid_score", "lokale_betrokkenheid"),
+  eerdere_participatie = c("vrijwilligerswerk_count", "politiek_count",
+                           "informal_helping_count", "online_informeel_count")
+)
+kernvars_alle <- unlist(kernvar_groepen, use.names = FALSE)
+
+missingness_dummies
+```
+
+# 5. Uitvalanalyse en single imputation
+
+```{r stap5-uitvalanalyse}
+modelvariabelen <- c(
+  "leeftijd", "opleidingsniveau", "inkomen_cat", "gezondheid", "vrije_tijd",
+  "religieus", "betrokkenheid_score", "lokale_betrokkenheid",
+  "civic_efficacy_score", "socialisatie_ouders_score", "gen_trust_score",
+  "mentale_gezondheid_score", "empathic_concern_score",
+  "service_motivation_score", "vrijwilligersnorm_score", "vertrouwen_regering"
+)
+
+data <- data |>
+  mutate(any_missing = as.integer(if_any(all_of(modelvariabelen), is.na)))
+
+data |> count(any_missing) |> mutate(pct = round(100 * n / sum(n), 1))
+
+# Leeftijd: Welch t-test
+t.test(leeftijd ~ any_missing, data = data)
+
+# Geslacht: chi-square. 'Overig' has n = 3, so the test is also run on a
+# collapsed two-category version, which is what the paper reports.
+data <- data |>
+  mutate(geslacht_2cat = factor(
+    if_else(geslacht == "Man", "Man", "Vrouw of overig"),
+    levels = c("Man", "Vrouw of overig")
+  ))
+
+tabel_geslacht <- table(data$any_missing, data$geslacht_2cat)
+tabel_geslacht
+chisq.test(tabel_geslacht, correct = TRUE)
+fisher.test(tabel_geslacht)
+
+# Buurtdeelname: is non-response related to the outcome itself?
+tabel_participatie <- table(data$any_missing, data$any_buurtactiviteit)
+tabel_participatie
+chisq.test(tabel_participatie, correct = TRUE)
+
+prop.test(
+  x = c(sum(data$any_buurtactiviteit[data$any_missing == 1]),
+        sum(data$any_buurtactiviteit[data$any_missing == 0])),
+  n = c(sum(data$any_missing == 1), sum(data$any_missing == 0))
+)
+
+data |>
+  group_by(any_missing) |>
+  summarise(n = n(),
+            participatiegraad = round(100 * mean(any_buurtactiviteit), 1),
+            .groups = "drop")
+```
+
+```{r stap5-imputatie}
+modus <- function(x) {
+  ux <- unique(na.omit(x))
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+continue_vars <- c(
+  "leeftijd", "netto_huishoudinkomen", "gezondheid", "vrije_tijd",
+  "politieke_voorkeur", "lokale_betrokkenheid", "betrokkenheid_score",
+  "civic_efficacy_score", "socialisatie_ouders_score", "gen_trust_score",
+  "mentale_gezondheid_score", "empathic_concern_score",
+  "service_motivation_score", "vrijwilligersnorm_score", "vertrouwen_regering"
+)
+categorische_vars <- c(
+  "leeftijdsgroep", "geslacht", "religieus", "koopwoning", "opleidingsniveau",
+  "burgerlijke_staat", "stedelijkheid_cat", "kinderen", "inkomen_cat",
+  "social_media_dagelijks", "ooit_nonprofit", "mvask2_dummy"
+)
+
+# How much is imputed per variable, before it disappears from view.
+imputatie_overzicht <- data.frame(
+  variabele = c(continue_vars, categorische_vars),
+  n_missing = sapply(data[c(continue_vars, categorische_vars)],
+                     function(x) sum(is.na(x))),
+  row.names = NULL
+) |>
+  mutate(pct_missing = round(100 * n_missing / nrow(data), 1)) |>
+  arrange(desc(n_missing))
+
+imputatie_overzicht
+
+for (v in continue_vars) {
+  data[[v]][is.na(data[[v]])] <- median(data[[v]], na.rm = TRUE)
+}
+for (v in categorische_vars) {
+  data[[v]][is.na(data[[v]])] <- modus(data[[v]])
+}
+
+# The dependent variables are never imputed.
+stopifnot(
+  !anyNA(data[c(continue_vars, categorische_vars)])
+)
+colSums(is.na(data[c("any_buurtactiviteit", "volunteer_any", "polpar_any",
+                     "informal_helping_dummy", "online_informeel_dummy")]))
+```
+
+# 6. Survey-design
+
+```{r stap6-design}
+stopifnot(!anyNA(data$gewicht))
+
+# ids = ~1 assumes a simple random sample with unequal selection
+# probabilities; the weight corrects the response for household size, region
+# and work situation. No clustering or stratification is modelled.
+survey_design <- svydesign(ids = ~1, weights = ~gewicht, data = data)
+
+survey_design
+```
+
+# 7. Beschrijvende statistiek en bivariate vergelijkingen
+
+```{r stap7-labels}
+activity_labels <- c(
+  actcit_buurtverg = "Buurtvergadering/inspraakavond",
+  actcit_socact    = "Sociale activiteit organiseren",
+  actcit_pubsp     = "Onderhoud openbare ruimte",
+  actcit_klus      = "Losse klussen voor buurtbewoner",
+  actcit_over      = "Toezicht houden in de buurt",
+  actcit_comc      = "Beheren buurtrestaurant/buurthuis",
+  actcit_energ     = "Samen duurzame energie inkopen",
+  actcit_bedr      = "Opzetten bedrijf met maatschappelijk doel",
+  actcit_zorg      = "Samen zorg inkopen/helpen bij gezondheid",
+  actcit_maat      = "Actie voor maatschappelijke problemen",
+  actcit_other     = "Anders"
+)
+
+data <- data |>
+  mutate(
+    across(all_of(activity_vars), ~ as.numeric(deelgenomen(.x)), .names = "d_{.col}"),
+    religie_binair = factor(
+      case_when(religie_lid == 1 ~ "Religieus", religie_lid == 0 ~ "Niet-religieus"),
+      levels = c("Niet-religieus", "Religieus")
+    ),
+    groep = factor(
+      if_else(any_buurtactiviteit == 1, "Participant", "Niet-participant"),
+      levels = c("Niet-participant", "Participant")
+    )
+  )
+
+activity_ind_vars <- paste0("d_", activity_vars)
+
+# Rebuild the design so it carries the new columns.
+survey_design <- svydesign(ids = ~1, weights = ~gewicht, data = data)
+```
+
+```{r stap7-tabel1}
+## Tabel 1: deelname per buurtactiviteit (gewogen)
+svymean(~any_buurtactiviteit, design = survey_design)
+
+# n_ongewogen is reported so you can apply the n >= 15 rule: a weighted
+# percentage resting on fewer than 15 respondents should not be shown.
+tabel1 <- lapply(activity_ind_vars, function(v) {
+  m <- svymean(as.formula(paste0("~", v)), design = survey_design)
+  data.frame(
+    variabele     = sub("^d_", "", v),
+    percentage    = round(100 * coef(m)[[1]], 0),
+    standaardfout = round(100 * SE(m)[[1]], 1),
+    n_ongewogen   = sum(data[[v]] == 1)
+  )
+}) |>
+  bind_rows() |>
+  mutate(
+    label      = activity_labels[variabele],
+    toon       = if_else(n_ongewogen >= 15, "ja", "NEE: n < 15")
+  ) |>
+  arrange(desc(percentage)) |>
+  select(label, percentage, standaardfout, n_ongewogen, toon)
+
+tabel1
+
+## Verdeling van het aantal activiteiten
+svymean(~buurtparticipatie_count, survey_design)
+round(100 * prop.table(svytable(~buurtparticipatie_count, survey_design)), 0)
+```
+
+```{r stap7-tabel2-categorisch}
+## Tabel 2: profielschets, categorische kenmerken (gewogen)
+cat_vars <- c(
+  "geslacht", "opleidingsniveau", "burgerlijke_staat", "kinderen",
+  "religie_binair", "religieus_cat", "koopwoning", "stedelijkheid_cat",
+  "leeftijdsgroep", "inkomen_cat", "social_media_dagelijks", "ooit_nonprofit",
+  "volunteer_any", "polpar_any", "mvask2_dummy",
+  "informal_helping_dummy", "online_informeel_dummy"
+)
+
+cat_vergelijking <- function(var, design, groepvar = "groep") {
+  form <- as.formula(paste0("~", var, "+", groepvar))
+  tab  <- svytable(form, design = design)
+  test <- tryCatch(svychisq(form, design = design, statistic = "Chisq"),
+                   error = function(e) NULL)
+  list(
+    variabele = var,
+    # Column percentages: the distribution within each group.
+    percentages = round(100 * prop.table(tab, margin = 2), 0),
+    n_ongewogen = table(data[[var]]),
+    p_waarde    = if (!is.null(test)) round(test$p.value, 3) else NA_real_
+  )
+}
+
+cat_resultaten <- lapply(cat_vars, cat_vergelijking, design = survey_design)
+names(cat_resultaten) <- cat_vars
+cat_resultaten
+```
+
+```{r stap7-tabel2-numeriek}
+## Tabel 2 vervolg: schaalscores (gewogen gemiddelden + t-toets)
+num_vars <- c(
+  "leeftijd", "netto_huishoudinkomen", "lokale_betrokkenheid",
+  "betrokkenheid_score", "civic_efficacy_score", "socialisatie_ouders_score",
+  "gen_trust_score", "mentale_gezondheid_score", "empathic_concern_score",
+  "service_motivation_score", "vrijwilligersnorm_score", "vertrouwen_regering"
+)
+
+num_vergelijking <- function(var, design, groepvar = "groep") {
+  gem  <- svyby(as.formula(paste0("~", var)), as.formula(paste0("~", groepvar)),
+                design = design, FUN = svymean)
+  test <- svyttest(as.formula(paste(var, "~", groepvar)), design = design)
+  data.frame(
+    variabele        = var,
+    niet_participant = round(gem[1, 2], 1),
+    participant      = round(gem[2, 2], 1),
+    verschil         = round(gem[2, 2] - gem[1, 2], 1),
+    t                = round(unname(test$statistic), 2),
+    p_waarde         = round(test$p.value, 3),
+    row.names        = NULL
+  )
+}
+
+tabel2_numeriek <- lapply(num_vars, num_vergelijking, design = survey_design) |>
+  bind_rows()
+
+tabel2_numeriek
+```
+
+```{r stap7-figuur2}
+## Figuur 2: deelname per activiteit, uitgesplitst naar subgroep (gewogen)
+subgroep_vars <- c(
+  "geslacht", "opleidingsniveau", "koopwoning", "leeftijdsgroep",
+  "religie_binair", "kinderen", "stedelijkheid_cat"
+)
+
+activiteit_per_subgroep <- function(subgroep, design) {
+  lapply(activity_ind_vars, function(v) {
+    sb <- svyby(as.formula(paste0("~", v)), as.formula(paste0("~", subgroep)),
+                design = design, FUN = svymean)
+    data.frame(
+      subgroep_variabele = subgroep,
+      subgroep_waarde    = as.character(sb[[subgroep]]),
+      activiteit         = activity_labels[sub("^d_", "", v)],
+      percentage         = round(100 * sb[[v]], 0),
+      se                 = round(100 * sb$se, 1),
+      row.names          = NULL
+    ) |>
+      mutate(se_waarschuwing = if_else(se > 3, "LET OP: brede SE", ""))
+  }) |> bind_rows()
+}
+
+subgroep_resultaten <- lapply(subgroep_vars, activiteit_per_subgroep,
+                              design = survey_design)
+names(subgroep_resultaten) <- subgroep_vars
+
+writexl::write_xlsx(subgroep_resultaten,
+                    file.path(uitvoermap, "profielverschillen_per_activiteit.xlsx"))
+
+subgroep_resultaten
+```
+
+# 8. Regressiemodellen (gewogen LPM)
+
+```{r stap8-helpers}
+# One estimator, one place. FAMILIE is set at the top of the script.
+fit_model <- function(dv, predictors, design) {
+  form <- as.formula(paste(dv, "~", paste(predictors, collapse = " + ")))
+  svyglm(form, design = design, family = FAMILIE)
+}
+
+# Under logit a perfectly predicting dummy breaks estimation. The LPM has no
+# such problem, so this check only excludes variables when the estimator is
+# logistic.
+check_separatie <- function(var, dv, data) {
+  any(table(data[[var]], data[[dv]]) == 0)
+}
+
+veilige_controles <- function(dv) {
+  if (!SEPARATIE_UITSLUITEN) return(controlevars)
+  risico <- sapply(missingness_dummies, check_separatie, dv = dv, data = data)
+  if (any(risico)) {
+    message("Uitgesloten wegens quasi-complete separatie met ", dv, ": ",
+            paste(names(risico)[risico], collapse = ", "))
+  }
+  setdiff(controlevars, names(risico)[risico])
+}
+
+ster <- function(p) dplyr::case_when(
+  p < .001 ~ "***", p < .01 ~ "**", p < .05 ~ "*", p < .10 ~ "†", TRUE ~ ""
+)
+
+tidy_b <- function(model) {
+  s <- summary(model)$coefficients
+  data.frame(
+    term = rownames(s),
+    b    = s[, "Estimate"],
+    se   = s[, "Std. Error"],
+    p    = s[, "Pr(>|t|)"],
+    row.names = NULL
+  )
+}
+
+fmt <- function(b, se, p) {
+  ifelse(is.na(b), "–",
+         paste0(sprintf("%.2f", b), ster(p), " (", sprintf("%.2f", se), ")"))
+}
+
+# The one diagnostic an LPM owes the reader: how often does it predict a
+# probability outside [0, 1]?
+lpm_bereik <- function(model) {
+  f <- fitted(model)
+  round(100 * mean(f < 0 | f > 1), 1)
+}
+```
+
+```{r stap8-tabel-a}
+## Tabel A: buurtparticipatie, hiërarchische opbouw
+dv_buurt <- "any_buurtactiviteit"
+ctrl_buurt <- veilige_controles(dv_buurt)
+
+pred_m1 <- ctrl_buurt
+pred_m2 <- c(pred_m1, kernvar_groepen$ses)
+pred_m3 <- c(pred_m2, kernvar_groepen$cohesie)
+pred_m4 <- c(pred_m3, kernvar_groepen$eerdere_participatie)
+
+modellen_hier <- list(
+  `Model 1: Controlevariabelen`     = fit_model(dv_buurt, pred_m1, survey_design),
+  `Model 2: + Sociaaleconomisch`    = fit_model(dv_buurt, pred_m2, survey_design),
+  `Model 3: + Cohesie`              = fit_model(dv_buurt, pred_m3, survey_design),
+  `Model 4: + Eerdere participatie` = fit_model(dv_buurt, pred_m4, survey_design)
+)
+
+if (LPM) {
+  data.frame(
+    model = names(modellen_hier),
+    pct_buiten_0_1 = sapply(modellen_hier, lpm_bereik),
+    row.names = NULL
+  )
+}
+```
+
+```{r stap8-tabel-a-opmaak}
+alle_vars <- c(kernvars_alle, controlevars)
+
+term_variabele <- function(term, vars) {
+  hit <- vars[startsWith(term, vars)]
+  if (length(hit) == 0) NA_character_ else hit[which.max(nchar(hit))]
+}
+blok_van <- function(v) dplyr::case_when(
+  v %in% kernvar_groepen$ses                  ~ "1. Sociaaleconomische status",
+  v %in% kernvar_groepen$cohesie              ~ "2. Cohesie",
+  v %in% kernvar_groepen$eerdere_participatie ~ "3. Eerdere participatie",
+  TRUE                                        ~ "4. Controlevariabelen"
+)
+
+tabel_A <- lapply(names(modellen_hier), function(nm) {
+  tidy_b(modellen_hier[[nm]]) |> mutate(model = nm, waarde = fmt(b, se, p))
+}) |>
+  bind_rows() |>
+  select(term, model, waarde) |>
+  tidyr::pivot_wider(names_from = model, values_from = waarde) |>
+  mutate(
+    variabele = vapply(term, term_variabele, character(1), vars = alle_vars),
+    blok      = if_else(term == "(Intercept)", "5. Constante", blok_van(variabele)),
+    variabele = factor(variabele, levels = alle_vars)
+  ) |>
+  arrange(blok, variabele, term) |>
+  mutate(across(starts_with("Model"), ~ tidyr::replace_na(.x, "–"))) |>
+  select(Blok = blok, Variabele = term, starts_with("Model"))
+
+tabel_A
+
+## Draagt elk blok gezamenlijk bij? (Wald op het volledige model)
+for (b in names(kernvar_groepen)) {
+  cat("\n---", b, "---\n")
+  print(regTermTest(modellen_hier[[4]],
+                    as.formula(paste("~", paste(kernvar_groepen[[b]], collapse = " + "))),
+                    method = "Wald"))
+}
+```
+
+```{r stap8-tabel-b}
+## Tabel B: volledig model per uitkomstmaat
+uitkomsten <- c(
+  Buurtparticipatie           = "any_buurtactiviteit",
+  `Formeel vrijwilligerswerk` = "volunteer_any",
+  `Informele hulp`            = "informal_helping_dummy",
+  `Informeel online helpen`   = "online_informeel_dummy",
+  `Politieke participatie`    = "polpar_any"
+)
+
+# A count predictor must not be used to predict its own dichotomous version.
+zelf_uitsluiten <- c(
+  volunteer_any          = "vrijwilligerswerk_count",
+  informal_helping_dummy = "informal_helping_count",
+  online_informeel_dummy = "online_informeel_count",
+  polpar_any             = "politiek_count"
+)
+
+modellen_uitkomst <- lapply(names(uitkomsten), function(lab) {
+  y     <- uitkomsten[[lab]]
+  preds <- kernvars_alle
+  if (y %in% names(zelf_uitsluiten)) {
+    preds <- setdiff(preds, zelf_uitsluiten[[y]])
+  }
+  fit_model(y, c(preds, veilige_controles(y)), survey_design)
+})
+names(modellen_uitkomst) <- names(uitkomsten)
+
+if (LPM) {
+  data.frame(
+    uitkomst = names(modellen_uitkomst),
+    pct_buiten_0_1 = sapply(modellen_uitkomst, lpm_bereik),
+    row.names = NULL
+  )
+}
+
+tabel_B <- lapply(names(modellen_uitkomst), function(lab) {
+  tidy_b(modellen_uitkomst[[lab]]) |> mutate(uitkomst = lab, waarde = fmt(b, se, p))
+}) |>
+  bind_rows() |>
+  select(term, uitkomst, waarde) |>
+  tidyr::pivot_wider(names_from = uitkomst, values_from = waarde) |>
+  mutate(
+    variabele = vapply(term, term_variabele, character(1), vars = alle_vars),
+    blok      = if_else(term == "(Intercept)", "5. Constante", blok_van(variabele)),
+    variabele = factor(variabele, levels = alle_vars)
+  ) |>
+  arrange(blok, variabele, term) |>
+  mutate(across(where(is.character), ~ tidyr::replace_na(.x, "–"))) |>
+  select(Blok = blok, Variabele = term, all_of(names(uitkomsten)))
+
+tabel_B
+
+## Wald-F per kernvariabelen-groep, per uitkomst
+wald_per_uitkomst <- lapply(names(modellen_uitkomst), function(lab) {
+  y     <- uitkomsten[[lab]]
+  model <- modellen_uitkomst[[lab]]
+  lapply(names(kernvar_groepen), function(g) {
+    vars <- kernvar_groepen[[g]]
+    if (y %in% names(zelf_uitsluiten)) vars <- setdiff(vars, zelf_uitsluiten[[y]])
+    w <- regTermTest(model, as.formula(paste("~", paste(vars, collapse = " + "))),
+                     method = "Wald")
+    data.frame(uitkomst = lab, groep = g,
+               F = round(unname(w$Ftest), 2), df1 = unname(w$df),
+               df2 = round(unname(w$ddf), 1), p = round(unname(w$p), 4),
+               row.names = NULL)
+  }) |> bind_rows()
+}) |> bind_rows()
+
+wald_per_uitkomst
+```
+
+# 9. Mediatieanalyse
+
+De mediatiemodellen behandelen de dichotome uitkomst numeriek, wat met een LPM
+in sectie 8 nu dezelfde schaal oplevert: coëfficiënten zijn verschillen in
+participatiekans. Ze bevatten geen controlevariabelen en zijn exploratief.
+
+Cross-sectionele mediatie identificeert geen causale route. Bovendien is
+buurtdeelname gemeten over het afgelopen jaar en zijn de mediatoren op het
+moment van de enquête gemeten, zodat de veronderstelde volgorde haaks staat op
+de meetvolgorde. Beide punten horen in de discussie.
+
+```{r stap9-paden}
+data <- data |>
+  mutate(
+    opleiding_hoog = as.numeric(opleidingsniveau == "Hoog"),
+    inkomen_hoog   = as.numeric(inkomen_cat == "Hoog (bovenste 20%)"),
+    stedelijk      = as.numeric(stedelijkheid_cat %in% c("Grote steden", "Kleine steden"))
+  )
+
+covariaten <- c("vrijwilligerswerk_count", "politiek_count")
+
+mediatie_paden <- list(
+  p1 = list(x = "opleiding_hoog",       m = "civic_efficacy_score",
+            label = "Opleiding via burgerlijke werkzaamheid"),
+  p2 = list(x = "opleiding_hoog",       m = "vertrouwen_regering",
+            label = "Opleiding via vertrouwen overheid"),
+  p3 = list(x = "inkomen_hoog",         m = "vertrouwen_regering",
+            label = "Inkomen via vertrouwen overheid"),
+  p4 = list(x = "stedelijk",            m = "lokale_betrokkenheid",
+            label = "Stedelijkheid via lokale betrokkenheid"),
+  p5 = list(x = "lokale_betrokkenheid", m = "service_motivation_score",
+            label = "Lokale betrokkenheid via service motivation"),
+  p6 = list(x = "lokale_betrokkenheid", m = "vrijwilligersnorm_score",
+            label = "Lokale betrokkenheid via vrijwilligersnorm"),
+  p7 = list(x = "betrokkenheid_score",  m = "vrijwilligersnorm_score",
+            label = "Betrokkenheid via vrijwilligersnorm")
+)
+```
+
+```{r stap9-schatten}
+maak_syntax <- function(x, m, covs = character(0)) {
+  cov_str <- if (length(covs)) paste0(" + ", paste(covs, collapse = " + ")) else ""
+  paste0(
+    "any_buurtactiviteit ~ c_pad*", x, " + b_pad*", m, cov_str, "\n",
+    m, " ~ a_pad*", x, cov_str, "\n",
+    "direct        := c_pad\n",
+    "indirect      := a_pad * b_pad\n",
+    "total         := c_pad + (a_pad * b_pad)\n",
+    "prop_mediated := (a_pad * b_pad) / (c_pad + (a_pad * b_pad))\n"
+  )
+}
+
+run_mediatie <- function(x, m, covs, data, label) {
+  vars <- unique(c(x, m, covs, "any_buurtactiviteit"))
+  d <- data |> mutate(across(all_of(vars), as.numeric))
+  tryCatch(
+    sem(maak_syntax(x, m, covs), data = d,
+        sampling.weights = "gewicht", se = "bootstrap", bootstrap = 1000),
+    error = function(e) {
+      message("FOUT bij ", label, ": ", conditionMessage(e))
+      NULL
+    }
+  )
+}
+
+fits <- list()
+for (nm in names(mediatie_paden)) {
+  p <- mediatie_paden[[nm]]
+  message("Bootstrapping: ", p$label)
+  fits[[paste0(nm, "_stap1")]] <- run_mediatie(p$x, p$m, character(0), data, p$label)
+  fits[[paste0(nm, "_stap2")]] <- run_mediatie(p$x, p$m, covariaten,  data, p$label)
+}
+
+overzicht_mediatie <- lapply(names(fits), function(nm) {
+  fit <- fits[[nm]]
+  if (is.null(fit)) return(NULL)
+  basis <- sub("_stap[12]$", "", nm)
+  pe <- parameterEstimates(fit, boot.ci.type = "bca.simple")
+  pe <- pe[pe$label %in% c("direct", "indirect", "total", "prop_mediated"), ]
+  data.frame(
+    pad     = mediatie_paden[[basis]]$label,
+    stap    = if (grepl("stap1$", nm)) "1. zonder covariaten" else "2. met eerdere participatie",
+    effect  = pe$label,
+    est     = round(pe$est, 3),
+    se      = round(pe$se, 3),
+    ci_laag = round(pe$ci.lower, 3),
+    ci_hoog = round(pe$ci.upper, 3),
+    p       = round(pe$pvalue, 3),
+    row.names = NULL
+  )
+}) |> bind_rows()
+
+overzicht_mediatie
+```
+
+```{r stap9-tabel}
+labels_x <- c(
+  opleiding_hoog       = "Opleidingsniveau (hoog)",
+  inkomen_hoog         = "Inkomen (hoogste 20%)",
+  stedelijk            = "Stedelijkheid",
+  lokale_betrokkenheid = "Lokale betrokkenheid",
+  betrokkenheid_score  = "Betrokkenheid"
+)
+labels_m <- c(
+  civic_efficacy_score     = "Burgerlijke werkzaamheid",
+  vertrouwen_regering      = "Vertrouwen in de overheid",
+  lokale_betrokkenheid     = "Lokale betrokkenheid",
+  service_motivation_score = "Motivatie voor de publieke zaak",
+  vrijwilligersnorm_score  = "Vrijwilligersnorm"
+)
+
+pad_labels <- vapply(mediatie_paden, function(p) {
+  paste0(labels_x[[p$x]], " → ", labels_m[[p$m]], " → Buurtparticipatie")
+}, character(1))
+kort_naar_lang <- setNames(unname(pad_labels),
+                           vapply(mediatie_paden, function(p) p$label, character(1)))
+
+komma <- function(x, dec = 2) gsub("\\.", ",", sprintf(paste0("%.", dec, "f"), x))
+
+effect_volgorde <- c("direct", "indirect", "total", "prop_mediated")
+
+# The mediated share is only interpretable when the total effect is
+# significant; otherwise it is a ratio with a near-zero denominator.
+totaal_sig <- overzicht_mediatie |>
+  filter(effect == "total") |>
+  transmute(pad, stap, totaal_significant = p < .05)
+
+tabel_mediatie <- overzicht_mediatie |>
+  left_join(totaal_sig, by = c("pad", "stap")) |>
+  mutate(
+    pad       = kort_naar_lang[pad],
+    stap_kort = if_else(grepl("^1", stap), "S1", "S2"),
+    waarde = case_when(
+      effect == "prop_mediated" & !totaal_significant ~ "–",
+      # Reported as a percentage, matching the text.
+      effect == "prop_mediated" ~ paste0(komma(100 * est, 1), "%", ster(p)),
+      TRUE ~ paste0(komma(est, 3), ster(p))
+    ),
+    effect = factor(effect, levels = effect_volgorde),
+    kolom  = paste0(stap_kort, "__", effect)
+  ) |>
+  select(pad, kolom, waarde) |>
+  tidyr::pivot_wider(names_from = kolom, values_from = waarde) |>
+  select(pad, paste0("S1__", effect_volgorde), paste0("S2__", effect_volgorde)) |>
+  mutate(pad = factor(pad, levels = unname(pad_labels))) |>
+  arrange(pad) |>
+  mutate(pad = as.character(pad))
+
+names(tabel_mediatie) <- c(
+  "Pad",
+  "Direct effect", "Indirect effect", "Totaal effect", "Aandeel gemedieerd",
+  "Direct effect ", "Indirect effect ", "Totaal effect ", "Aandeel gemedieerd "
+)
+
+tabel_mediatie
+```
+
+# 10. Modeldiagnostiek
+
+```{r stap10-wald}
+wald_overzicht <- lapply(names(modellen_hier), function(naam) {
+  model <- modellen_hier[[naam]]
+  preds <- attr(terms(model), "term.labels")
+  w <- regTermTest(model, as.formula(paste("~", paste(preds, collapse = " + "))),
+                   method = "Wald")
+  data.frame(
+    model = naam,
+    F     = round(unname(w$Ftest), 2),
+    df1   = unname(w$df),
+    df2   = round(unname(w$ddf), 1),
+    p     = unname(w$p),
+    row.names = NULL
+  )
+}) |>
+  bind_rows() |>
+  # Report p as "< ,001" rather than as 2e-04.
+  mutate(p_weergave = if_else(p < .001, "< ,001", gsub("\\.", ",", sprintf("%.3f", p))))
+
+wald_overzicht
+```
+
+```{r stap10-vif}
+# VIF is computed on an unweighted glm with the SAME family as the survey
+# models, so the diagnostic matches the models it describes.
+vif_overzicht <- lapply(names(modellen_uitkomst), function(naam) {
+  model <- modellen_uitkomst[[naam]]
+  tryCatch(
+    car::vif(glm(formula(model), data = data, family = FAMILIE)),
+    error = function(e) {
+      message("VIF overgeslagen voor '", naam, "': ", conditionMessage(e))
+      NULL
+    }
+  )
+})
+names(vif_overzicht) <- names(modellen_uitkomst)
+
+vif_naar_df <- function(v, naam) {
+  if (is.null(v)) return(NULL)
+  if (is.matrix(v)) {
+    data.frame(variabele = rownames(v), waarde = v[, "GVIF^(1/(2*Df))"],
+               model = naam, row.names = NULL)
+  } else {
+    # With 1 df, sqrt(VIF) equals GVIF^(1/(2*Df)).
+    data.frame(variabele = names(v), waarde = sqrt(as.numeric(v)),
+               model = naam, row.names = NULL)
+  }
+}
+
+vif_tabel <- lapply(names(vif_overzicht), function(nm) {
+  vif_naar_df(vif_overzicht[[nm]], nm)
+}) |>
+  bind_rows() |>
+  mutate(waarde = gsub("\\.", ",", sprintf("%.2f", waarde))) |>
+  tidyr::pivot_wider(names_from = model, values_from = waarde) |>
+  mutate(across(-variabele, ~ tidyr::replace_na(.x, "–")))
+
+vif_tabel
+```
+
+# 11. Word-export
+
+```{r stap11-labels}
+labels_term <- c(
+  "(Intercept)"                                = "Constante",
+  "opleidingsniveauMidden"                     = "MBO/Havo/VWO",
+  "opleidingsniveauHoog"                       = "HBO/WO",
+  "inkomen_catMidden (middelste 60%)"          = "Midden (middelste 60%)",
+  "inkomen_catHoog (bovenste 20%)"             = "Hoog (bovenste 20%)",
+  "koopwoning"                                 = "Koopwoning",
+  "stedelijkheid_catKleine steden"             = "Kleine stad",
+  "stedelijkheid_catGrote steden"              = "Grote stad",
+  "betrokkenheid_score"                        = "Betrokkenheid",
+  "lokale_betrokkenheid"                       = "Lokale betrokkenheid",
+  "vrijwilligerswerk_count"                    = "Aantal typen vrijwilligerswerk",
+  "politiek_count"                             = "Aantal politieke activiteiten",
+  "informal_helping_count"                     = "Aantal typen informele hulp",
+  "online_informeel_count"                     = "Aantal typen online informele hulp",
+  "leeftijdsgroepMiddelbaar volwassen (35-64)" = "Middelbaar volwassen (35-64)",
+  "leeftijdsgroepSenioren (65+)"               = "Senioren (65+)",
+  "geslachtVrouw"                              = "Vrouw",
+  "geslachtOverig"                             = "Overig",
+  "religieus"                                  = "Religieus",
+  "burgerlijke_staatGehuwd"                    = "Gehuwd",
+  "burgerlijke_staatPartner samenwonend"       = "Partner samenwonend",
+  "burgerlijke_staatPartner niet-samenwonend"  = "Partner niet-samenwonend",
+  "kinderen"                                   = "Kinderen",
+  "gezondheid"                                 = "Ervaren gezondheid",
+  "vrije_tijd"                                 = "Vrije tijd",
+  "social_media_dagelijks"                     = "Dagelijks sociale media",
+  "ooit_nonprofit"                             = "Gewerkt in non-profit",
+  "politieke_voorkeur"                         = "Politieke voorkeur (links-rechts)"
+)
+
+opschonen <- function(tab) {
+  tab |>
+    filter(!grepl("^mis_", Variabele)) |>
+    mutate(Variabele = dplyr::coalesce(labels_term[Variabele], Variabele)) |>
+    mutate(across(-c(Blok, Variabele), ~ gsub("\\.", ",", .x)))
+}
+
+schatter_regel <- if (LPM) {
+  paste0(
+    "Lineair waarschijnlijkheidsmodel (survey-gewogen OLS). ",
+    "Coëfficiënten zijn verschillen in de kans op deelname; ",
+    "0,10 staat voor tien procentpunt. Standaardfouten tussen haakjes zijn ",
+    "design-based en daarmee robuust tegen heteroskedasticiteit. "
+  )
+} else {
+  "Logit-coëfficiënten, standaardfouten tussen haakjes. "
+}
+
+voet <- paste0(
+  "N = ", nrow(data), ". ", schatter_regel,
+  "Referentiecategorieën: opleiding = laag, inkomen = onderste 20%, ",
+  "stedelijkheid = dorp, leeftijd = 18-34, burgerlijke staat = alleenstaand, ",
+  "geslacht = man, religieus = niet-religieus. ",
+  "Alle modellen bevatten dummyvariabelen voor ontbrekende waarden ",
+  "(zie de paragraaf over missing data); deze zijn omwille van de ",
+  "leesbaarheid niet weergegeven. – = niet opgenomen in dit model. ",
+  "† p < ,10  * p < ,05  ** p < ,01  *** p < ,001"
+)
+
+maak_ft <- function(tab) {
+  opschonen(tab) |>
+    as_grouped_data(groups = "Blok") |>
+    as_flextable(hide_grouplabel = TRUE) |>
+    theme_booktabs() |>
+    fontsize(size = 8, part = "all") |>
+    fontsize(size = 7, part = "footer") |>
+    padding(padding.top = 1, padding.bottom = 1, part = "all") |>
+    bold(i = ~ !is.na(Blok)) |>
+    autofit() |>
+    add_footer_lines(voet)
+}
+```
+
+```{r stap11-export-regressie}
+read_docx() |>
+  body_add_par("Tabel A: Buurtparticipatie, hiërarchische modelopbouw",
+               style = "heading 2") |>
+  body_add_flextable(maak_ft(tabel_A)) |>
+  body_add_break() |>
+  body_add_par("Tabel B: Volledig model per uitkomstmaat", style = "heading 2") |>
+  body_add_flextable(maak_ft(tabel_B)) |>
+  body_end_section_landscape() |>
+  print(target = file.path(uitvoermap, "tabellen_regressie.docx"))
+
+cat("Opgeslagen:", file.path(uitvoermap, "tabellen_regressie.docx"), "\n")
+```
+
+```{r stap11-export-mediatie}
+voet_med <- paste0(
+  "N = ", nrow(data),
+  ". Ongestandaardiseerde coëfficiënten; bootstrapped standaardfouten ",
+  "(1.000 herhalingen, BCa-intervallen); gewogen via steekproefgewichten. ",
+  "Stap 2 bevat eerder formeel vrijwilligerswerk en eerdere politieke ",
+  "participatie als covariaat. Het aandeel gemedieerd is alleen weergegeven ",
+  "waar het totale effect significant is (p < ,05); bij een niet-significant ",
+  "totaal effect is dit aandeel niet interpreteerbaar. ",
+  "De modellen bevatten geen controlevariabelen en zijn exploratief; ",
+  "cross-sectionele mediatie identificeert geen causale route. ",
+  "† p < ,10  * p < ,05  ** p < ,01  *** p < ,001"
+)
+
+ft_med <- flextable(tabel_mediatie) |>
+  add_header_row(
+    values    = c("", "Stap 1: zonder covariaten", "Stap 2: met eerdere participatie"),
+    colwidths = c(1, 4, 4)
+  ) |>
+  theme_booktabs() |>
+  fontsize(size = 8, part = "all") |>
+  fontsize(size = 7, part = "footer") |>
+  bold(part = "header") |>
+  align(j = 2:9, align = "center", part = "all") |>
+  align(j = 1, align = "left", part = "all") |>
+  padding(padding.top = 2, padding.bottom = 2, part = "all") |>
+  width(j = 1, width = 3.1) |>
+  width(j = 2:9, width = 0.80) |>
+  add_footer_lines(voet_med)
+
+read_docx() |>
+  body_add_par("Tabel C: Mediatieanalyse buurtparticipatie", style = "heading 2") |>
+  body_add_flextable(ft_med) |>
+  body_end_section_landscape() |>
+  print(target = file.path(uitvoermap, "tabel_mediatie.docx"))
+
+cat("Opgeslagen:", file.path(uitvoermap, "tabel_mediatie.docx"), "\n")
+```
+
+```{r stap11-export-bijlagen}
+## Bijlage: Wald-toetsen
+ft_wald <- wald_overzicht |>
+  select(Model = model, F, df1, df2, `p` = p_weergave) |>
+  flextable() |>
+  theme_booktabs() |>
+  fontsize(size = 8, part = "all") |>
+  bold(part = "header") |>
+  autofit() |>
+  add_footer_lines(paste0(
+    "Gewogen Wald-toets voor de gezamenlijke significantie van de predictoren ",
+    "in elk model, ten opzichte van een intercept-only model."
+  ))
+
+## Bijlage: (G)VIF
+names(vif_tabel)[1] <- "Variabele"
+ft_vif <- vif_tabel |>
+  flextable() |>
+  theme_booktabs() |>
+  fontsize(size = 8, part = "all") |>
+  fontsize(size = 7, part = "footer") |>
+  bold(part = "header") |>
+  padding(padding.top = 1.5, padding.bottom = 1.5, part = "all") |>
+  align(j = 2:ncol(vif_tabel), align = "center", part = "all") |>
+  autofit() |>
+  add_footer_lines(paste0(
+    "Weergegeven is GVIF^(1/(2×Df)); deze maat is vergelijkbaar tussen ",
+    "variabelen met verschillende aantallen categorieën. Waarden boven ",
+    "circa 2,2 (equivalent aan VIF > 5) duiden op mogelijke ",
+    "multicollineariteit. – = variabele niet opgenomen in dit model."
+  ))
+
+## Bijlage: schaalbetrouwbaarheid
+ft_alpha <- alpha_overzicht |>
+  mutate(across(where(is.numeric), ~ gsub("\\.", ",", sprintf("%.2f", .x)))) |>
+  select(Schaal = schaal, `Aantal items` = n_items,
+         `Omgekeerd` = n_omgekeerd, `Cronbach's alpha` = raw_alpha,
+         `Gestandaardiseerde alpha` = std_alpha,
+         `Gem. item-rest correlatie` = gem_r_drop) |>
+  flextable() |>
+  theme_booktabs() |>
+  fontsize(size = 8, part = "all") |>
+  bold(part = "header") |>
+  autofit()
+
+read_docx() |>
+  body_add_par("Bijlage: Schaalbetrouwbaarheid", style = "heading 2") |>
+  body_add_flextable(ft_alpha) |>
+  body_add_break() |>
+  body_add_par("Bijlage: Multivariate modeltoetsing (Wald)", style = "heading 2") |>
+  body_add_flextable(ft_wald) |>
+  body_add_break() |>
+  body_add_par("Bijlage: Multicollineariteit ((G)VIF)", style = "heading 2") |>
+  body_add_flextable(ft_vif) |>
+  body_end_section_landscape() |>
+  print(target = file.path(uitvoermap, "bijlagen_diagnostiek.docx"))
+
+cat("Opgeslagen:", file.path(uitvoermap, "bijlagen_diagnostiek.docx"), "\n")
+```
+
+```{r sessie}
+sessionInfo()
+```
 

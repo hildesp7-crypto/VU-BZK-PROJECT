@@ -19,7 +19,7 @@ ruwe_data <- read_excel(pad_steekproef, sheet = "Volledige steekproef") |>
 
 nrow(ruwe_data)
 
-# The second sheet should contain exactly the rows flagged as burgerinitiatief.
+# Sheet 2 bevat rijen met alleen burgerinitiatieven.
 controle_bc <- read_excel(pad_steekproef, sheet = "Burgercollectieven") |>
   clean_names() |>
   filter(!is.na(koepel_organisatie))
@@ -33,7 +33,7 @@ c(
                         length(setdiff(vlag_namen, controle_bc$naam_organisatie))
 )
 
-# Map the koepel labels as they appear in the workbook onto the eight strata of Table B2.1.
+# Koepel labels zoals Tabel B2.1 uit Bekkers et al. (2024). 
 stratum_lookup <- tribble(
   ~koepel_organisatie,        ~stratum,
   "Cooplink",                 "Cooplink",
@@ -52,7 +52,7 @@ stratum_lookup <- tribble(
   "LEM2",                     "Energie Samen"
 )
 
-# Sampling frame sizes from Table B2.1 (total frame 14.660). Replace for the 2026 frame.
+# Sample frame sizes uit tabel B2.1 (totaal frame 14.660).
 populatie <- tribble(
   ~stratum,             ~n_populatie,
   "Cooplink",                    149,
@@ -69,7 +69,6 @@ ruwe_data <- ruwe_data |>
   mutate(koepel_organisatie = str_squish(koepel_organisatie)) |>
   left_join(stratum_lookup, by = "koepel_organisatie")
 
-# Any label that did not match is a spelling variant that must be added to the lookup.
 ruwe_data |> filter(is.na(stratum)) |> count(koepel_organisatie)
 
 gewichten <- ruwe_data |>
@@ -105,10 +104,8 @@ c(
   n_effectief = sum(w)^2 / sum(w^2)
 )
 
-# The website column holds either a URL or "Onbekend/Onbekend"; one entry lacks the http
-# prefix, so match www. as well. Social media columns mix a bare "Nee" with
-# "Ja (actief augustus 2026)" and "Ja (niet actief)": separate presence from activity
-# instead of letting every month-label become its own category.
+# Social media & website hercoderen: Website link = "Ja".
+# Sociale media = "Ja" of "Nee", maand van laatste activiteit niet apart meetellen. 
 data_hercodeerd <- ruwe_data |>
   mutate(
     heeft_website = if_else(
@@ -148,9 +145,7 @@ data_hercodeerd <- ruwe_data |>
     )
 )
 
-# `actief` and `werkgebied` carry free-text elaborations that split categories meaning the
-# same thing: "Landelijk" vs "Landelijk (Nederland)", four flavours of "Regionaal",
-# "Opgeheven (gestopt in 2026)" vs "Opgeheven".
+# Zelfde voor variaties in Landelijk & Opgeheven
 data_hercodeerd <- data_hercodeerd |>
   mutate(
     actief_hercodeerd = case_when(
@@ -176,19 +171,16 @@ data_hercodeerd <- data_hercodeerd |>
     )
   )
 
-# Check every recode against its source column before trusting it.
+# Hercoderingen checken
 data_hercodeerd |> count(heeft_website, heeft_url = str_starts(website, "http"))
 data_hercodeerd |> count(actief, actief_hercodeerd) |> arrange(actief_hercodeerd)
 data_hercodeerd |> count(werkgebied, werkgebied_hercodeerd) |> arrange(werkgebied_hercodeerd)
 data_hercodeerd |> count(facebook_pagina, heeft_facebook, status_facebook_pagina) |> head(10)
 
-# Stratified sample without replacement; fpc uses the frame size per stratum.
 design_alle <- data_hercodeerd |>
   as_survey_design(ids = 1, strata = stratum, weights = gewicht, fpc = n_populatie)
 
-# The subset keeps the weights of the full sample: recomputing N/n here would erase the
-# selection on "is a burgercollectief", which is precisely the quantity being estimated.
-# Use subset() rather than filtering the data first, so the design information survives.
+# Subset gebruiken voor de burgerinitiatieven
 design_bc <- design_alle |> filter(burgerinitiatief == "Ja")
 
 c(
@@ -198,8 +190,7 @@ c(
   gewogen_bc    = sum(data_hercodeerd$gewicht[data_hercodeerd$burgerinitiatief == "Ja"])
 )
 
-# Logit CIs rather than the normal approximation: proportions near zero otherwise get
-# impossible negative lower bounds.
+# Tabel maken
 gewogen_tabel <- function(design, var) {
   ruwe_n <- design$variables |>
     count(categorie = as.character(.data[[var]]), name = "n_ongewogen")
@@ -225,8 +216,7 @@ gewogen_tabel <- function(design, var) {
     arrange(desc(pct))
 }
 
-# Free-text fields, identifiers and the raw versions of recoded columns are not
-# distributions worth tabulating.
+# Labels
 uitsluiten <- c(
   "naam_organisatie", "naam_zoals_in_kvk_register", "kvk_beschrijving", "adres", "plaats",
   "website", "link_naar_jaarverslag", "missie_doelstelling_activiteiten_website",
@@ -249,7 +239,7 @@ tabellen_alle <- map(kandidaten, ~ gewogen_tabel(design_alle, .x)) |>
   bind_rows() |>
   rename_with(~ paste0(.x, "_alle"), c(n_ongewogen, pct, pct_ci, aantal, aantal_ci))
 
-# burgerinitiatief is constant in the subset, so it has no distribution there.
+# burgerinitiatief is constant 
 kandidaten_bc <- setdiff(kandidaten, "burgerinitiatief")
 
 tabellen_bc <- map(kandidaten_bc, ~ gewogen_tabel(design_bc, .x)) |>
@@ -262,9 +252,6 @@ vergelijking <- tabellen_alle |>
 
 vergelijking
 
-# Keep `variabele` in every printed table: with results='asis' the cat() heading only shows
-# up in the knitted document, so running this chunk in the console would otherwise give a
-# stack of tables with no way to tell which variable each one belongs to.
 vergelijking |>
   group_split(variabele) |>
   walk(function(tab) {
@@ -272,20 +259,17 @@ vergelijking |>
     print(kable(tab, caption = paste("Variabele:", tab$variabele[1])))
   })
 
-# Named list, so a single variable can be pulled up interactively without hunting through
-# the full comparison table.
+# Named list
 tabellen <- vergelijking |>
   group_split(variabele) |>
   set_names(map_chr(vergelijking |> group_split(variabele), ~ .x$variabele[1]))
 
 names(tabellen)
 
-# Example: one variable at a time.
+# Voorbeeld: 1 variabele per keer
 tabellen[["heeft_website"]]
 tabellen[["werkgebied_hercodeerd"]]
 
-# Doelgroep is a multiple-response field (semicolon-separated), so it is not a distribution:
-# percentages are of initiatives and sum to more than 100.
 doelgroep_verdeling <- function(df, label) {
   df |>
     separate_rows(doelgroep, sep = ";") |>
@@ -302,6 +286,7 @@ bind_rows(
   doelgroep_verdeling(filter(data_hercodeerd, burgerinitiatief == "Ja"), "burgercollectieven")
 )
 
+# Opslaan als csv tabel
 readr::write_csv(vergelijking, here("output", "gewogen_verdelingen.csv"))
 readr::write_csv(data_hercodeerd, here("output", "steekproef_gewogen_hercodeerd.csv"))
 readr::write_csv(gewichten, here("output", "gewichten_per_koepel.csv"))
